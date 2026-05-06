@@ -204,6 +204,11 @@ impl FlashAttn {
                 /* window_size_left */ window_size_left,
                 /* window_size_right */ window_size_right,
                 /* softcap */ self.softcap.unwrap_or(0f32),
+                // PR-FA-2 splitkv defaults — dense path identical to PR-FA-1.
+                /* num_splits */ 1,
+                /* softmax_lseaccum_ptr */ std::ptr::null(),
+                /* oaccum_ptr */ std::ptr::null(),
+                /* force_split_kernel */ 0,
             )
         }
 
@@ -669,6 +674,11 @@ impl FlashAttnVarLen {
                 /* window_size_left */ window_size_left,
                 /* window_size_right */ window_size_right,
                 /* softcap */ self.softcap.unwrap_or(0.0),
+                // PR-FA-2 splitkv defaults — dense path identical to PR-FA-1.
+                /* num_splits */ 1,
+                /* softmax_lseaccum_ptr */ std::ptr::null(),
+                /* oaccum_ptr */ std::ptr::null(),
+                /* force_split_kernel */ 0,
             )
         }
 
