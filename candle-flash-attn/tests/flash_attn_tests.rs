@@ -156,6 +156,35 @@ fn flash_attn_acausal_splitkv() -> Result<()> {
     let (b, h, sq, sk, d) = (1usize, 2, 8, 512, 64);
     let scale = 1.0f32 / (d as f32).sqrt();
 
+    // Provenance check: assert the dispatcher actually picks splitkv for this
+    // shape on this device, so the test fails (instead of silently passing
+    // via the dense path) if the heuristic ever regresses. Mirrors the
+    // computation done inside `set_params_splitkv` in src/lib.rs.
+    {
+        let cuda_dev = device.as_cuda_device()?;
+        let num_sm = cuda_dev
+            .cuda_stream()
+            .context()
+            .attribute(
+                candle::cuda_backend::cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )
+            .map_err(|e| anyhow::anyhow!("cuDeviceGetAttribute(MULTIPROCESSOR_COUNT): {e}"))?
+            as usize;
+        let block_n = candle_flash_attn::splitkv_block_n(d);
+        let num_n_blocks = (sk + block_n - 1) / block_n;
+        let num_m_blocks = (sq + 64 - 1) / 64;
+        let num_splits = candle_flash_attn::num_splits_heuristic(
+            b * h * num_m_blocks,
+            num_sm * 2,
+            num_n_blocks,
+            128,
+        );
+        assert!(
+            num_splits > 1,
+            "expected splitkv path for shape (b={b}, h={h}, sq={sq}, sk={sk}, d={d}) on a {num_sm}-SM device, but heuristic chose num_splits={num_splits}",
+        );
+    }
+
     // Flash-attn input layout is (batch, seq, heads, head_dim).
     let q = (Tensor::arange(0u32, (b * sq * h * d) as u32, &device)?
         .to_dtype(DType::F16)?

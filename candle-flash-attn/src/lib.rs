@@ -11,7 +11,11 @@ use half::{bf16, f16};
 /// in `kernels/flash_fwd_launch_template.h:168`. If upstream changes the
 /// per-hdim block size, this table needs the same change or `num_splits`
 /// will be miscomputed.
-fn splitkv_block_n(head_size: usize) -> usize {
+///
+/// `#[doc(hidden)] pub` so integration tests can predict which split count
+/// the dispatcher will pick for a given shape; not part of the supported API.
+#[doc(hidden)]
+pub fn splitkv_block_n(head_size: usize) -> usize {
     if head_size <= 64 {
         256
     } else if head_size <= 128 {
@@ -28,7 +32,13 @@ fn splitkv_block_n(head_size: usize) -> usize {
 /// Inputs `batch_nheads_mblocks` and `num_sms` should already be doubled if
 /// the splitkv kernel uses 128 threads/block (as upstream does). See the
 /// `num_sm * 2` factor in `set_params_splitkv`.
-fn num_splits_heuristic(
+///
+/// `#[doc(hidden)] pub` so integration tests can verify the dispatcher
+/// actually entered the splitkv path for a given shape (i.e. catch silent
+/// fallback to dense if the heuristic regresses); not part of the supported
+/// API and may change without notice.
+#[doc(hidden)]
+pub fn num_splits_heuristic(
     batch_nheads_mblocks: usize,
     num_sms: usize,
     num_n_blocks: usize,
