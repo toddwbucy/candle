@@ -30,7 +30,7 @@ impl FlashAttn {
         v_l: &Layout,
         is_bf16: bool,
     ) -> Result<(candle::CudaStorage, Shape)> {
-        // https://github.com/Dao-AILab/flash-attention/blob/b252072409e69c25f2b9d473cc534e49b24decd2/csrc/flash_attn/flash_api.cpp#L187
+        // https://github.com/Dao-AILab/flash-attention/blob/060c9188beec3a8b62b33a3bfa6d5d2d44975fab/csrc/flash_attn/flash_api.cpp (v2.8.3, vendored 2026-05-06 per HF#3515)
         let dev = q.device();
         let out_shape = q_l.shape().clone();
         let out_l = Layout::contiguous(&out_shape);
@@ -462,7 +462,7 @@ impl FlashAttnVarLen {
         v_l: &Layout,
         is_bf16: bool,
     ) -> Result<(candle::CudaStorage, Shape)> {
-        // https://github.com/Dao-AILab/flash-attention/blob/184b992dcb2a0890adaa19eb9b541c3e4f9d2a08/csrc/flash_attn/flash_api.cpp#L327
+        // https://github.com/Dao-AILab/flash-attention/blob/060c9188beec3a8b62b33a3bfa6d5d2d44975fab/csrc/flash_attn/flash_api.cpp (v2.8.3, vendored 2026-05-06 per HF#3515)
         let dev = q.device();
         let out_shape = q_l.shape().clone();
         let out_l = Layout::contiguous(&out_shape);

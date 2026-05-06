@@ -1,7 +1,32 @@
+// candle-flash-attn host dispatch: thin extern "C" wrapper around
+// Tri Dao's flash_fwd kernel templates.
+//
+// PR-FA-1 update: vendored kernels were bumped from the post-Dec-2024
+// state to upstream v2.8.3 (commit 060c918, 2025-08-14). v2.8.3 wraps
+// the kernel templates in `namespace flash`, so `run_mha_fwd_<>` and
+// `Flash_fwd_params` now live under `FLASH_NAMESPACE` (= `flash`).
+// We wrap the dispatcher accordingly and qualify references in the
+// extern "C" function. The dispatch itself is intentionally kept
+// minimal — splitkv-aware dispatch + `set_params_splitkv` allocation
+// land in PR-FA-2/PR-FA-3 (per docs/infrastructure/candle-fa-bump-plan.md).
+
+#include <cstdio>
+#include <cstdlib>
+
 #include "kernels.h"
 #include "kernel_helpers.h"
+#include "namespace_config.h"
 #include "flash_fwd_launch_template.h"
 
+namespace FLASH_NAMESPACE {
+
+// Templated dispatch wrapper. Calls the auto-generated
+// `run_mha_fwd_<elem_type, kHeadDim, Is_causal>` specialisations
+// vendored from Tri Dao v2.8.3's flash_fwd_hdim*_*_sm80.cu files.
+//
+// candle's PR-FA-1 keeps the dispatcher dense-only (`num_splits=1`
+// is forced in the caller below); the splitkv branch from
+// v2.8.3's flash_api.cpp lands in PR-FA-2.
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
   FP16_SWITCH(!params.is_bf16, [&] {
       HEADDIM_SWITCH(params.d, [&] {
@@ -11,6 +36,8 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
       });
   });
 }
+
+} // namespace FLASH_NAMESPACE
 
 extern "C" void run_mha(
     void *q_ptr,
@@ -60,7 +87,7 @@ extern "C" void run_mha(
 
     float softcap
 ) {
-    Flash_fwd_params params;
+    FLASH_NAMESPACE::Flash_fwd_params params;
     // Reset the parameters
     memset(&params, 0, sizeof(params));
 
@@ -131,6 +158,22 @@ extern "C" void run_mha(
     params.num_splits = 1;
     params.unpadded_lse = unpadded_lse;
 
+    // Tripwire: candle-flash-attn does not support dropout. `philox_unpack.cuh`
+    // is a stubbed replacement (returns a fake seed/offset pair) so the dropout
+    // codepath inside `flash_fwd_kernel.h` compiles, but executing it would
+    // silently produce garbage. Dropout is currently impossible to reach because
+    // `params.p_dropout` is hard-set to 1.0 above and is not an FFI input —
+    // this check catches anyone re-introducing a dropout path without also
+    // wiring a real philox state. Unconditional (not `assert`) so the guard
+    // remains active in release builds.
+    if (params.p_dropout != 1.f) {
+        std::fprintf(stderr,
+                     "candle-flash-attn: dropout is not supported "
+                     "(philox_unpack.cuh is stubbed); got p_dropout=%f\n",
+                     params.p_dropout);
+        std::abort();
+    }
+
     cudaStream_t stream = 0; // Use the default stream.
-    run_mha_fwd(params, stream);
+    FLASH_NAMESPACE::run_mha_fwd(params, stream);
 }
