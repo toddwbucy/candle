@@ -10,7 +10,8 @@
 // minimal — splitkv-aware dispatch + `set_params_splitkv` allocation
 // land in PR-FA-2/PR-FA-3 (per docs/infrastructure/candle-fa-bump-plan.md).
 
-#include <cassert>
+#include <cstdio>
+#include <cstdlib>
 
 #include "kernels.h"
 #include "kernel_helpers.h"
@@ -162,10 +163,16 @@ extern "C" void run_mha(
     // codepath inside `flash_fwd_kernel.h` compiles, but executing it would
     // silently produce garbage. Dropout is currently impossible to reach because
     // `params.p_dropout` is hard-set to 1.0 above and is not an FFI input —
-    // this assert catches anyone re-introducing a dropout path without also
-    // wiring a real philox state.
-    assert(params.p_dropout == 1.f &&
-           "candle-flash-attn does not support dropout (philox_unpack stubbed)");
+    // this check catches anyone re-introducing a dropout path without also
+    // wiring a real philox state. Unconditional (not `assert`) so the guard
+    // remains active in release builds.
+    if (params.p_dropout != 1.f) {
+        std::fprintf(stderr,
+                     "candle-flash-attn: dropout is not supported "
+                     "(philox_unpack.cuh is stubbed); got p_dropout=%f\n",
+                     params.p_dropout);
+        std::abort();
+    }
 
     cudaStream_t stream = 0; // Use the default stream.
     FLASH_NAMESPACE::run_mha_fwd(params, stream);
