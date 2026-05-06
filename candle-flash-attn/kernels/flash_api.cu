@@ -1,14 +1,23 @@
 // candle-flash-attn host dispatch: thin extern "C" wrapper around
 // Tri Dao's flash_fwd kernel templates.
 //
-// PR-FA-1 update: vendored kernels were bumped from the post-Dec-2024
-// state to upstream v2.8.3 (commit 060c918, 2025-08-14). v2.8.3 wraps
-// the kernel templates in `namespace flash`, so `run_mha_fwd_<>` and
-// `Flash_fwd_params` now live under `FLASH_NAMESPACE` (= `flash`).
-// We wrap the dispatcher accordingly and qualify references in the
-// extern "C" function. The dispatch itself is intentionally kept
-// minimal — splitkv-aware dispatch + `set_params_splitkv` allocation
-// land in PR-FA-2/PR-FA-3 (per docs/infrastructure/candle-fa-bump-plan.md).
+// PR-FA-2 update: extend the dispatcher to mirror v2.8.3's
+// `run_mha_fwd(params, stream, force_split_kernel)` shape — branch on
+// `num_splits <= 1 && !force_split_kernel` to choose between the dense
+// `run_mha_fwd_<>` and `run_mha_fwd_splitkv_dispatch<>` kernel
+// templates. The FFI `extern "C" run_mha` exposes the new params
+// (`num_splits`, `softmax_lseaccum_ptr`, `oaccum_ptr`,
+// `force_split_kernel`) so Rust callers can drive splitkv. PR-FA-2
+// keeps Rust-side defaults at `num_splits=1` and null accumulator
+// pointers, so the dense path is taken and existing behavior is
+// unchanged. PR-FA-3 wires the Rust-side `set_params_splitkv`
+// equivalent (heuristic + accumulator buffer allocation).
+//
+// PR-FA-1 (already merged): vendored kernels were bumped from the
+// post-Dec-2024 state to upstream v2.8.3 (commit 060c918, 2025-08-14).
+// v2.8.3 wraps the kernel templates in `namespace flash`, so
+// `run_mha_fwd_<>` and `Flash_fwd_params` live under `FLASH_NAMESPACE`
+// (= `flash`).
 
 #include <cstdio>
 #include <cstdlib>
@@ -20,18 +29,64 @@
 
 namespace FLASH_NAMESPACE {
 
-// Templated dispatch wrapper. Calls the auto-generated
-// `run_mha_fwd_<elem_type, kHeadDim, Is_causal>` specialisations
-// vendored from Tri Dao v2.8.3's flash_fwd_hdim*_*_sm80.cu files.
+// Suppress implicit instantiation of `run_mha_fwd_splitkv_dispatch<>` in this
+// TU. Without these declarations cicc would expand all 24 tuples
+// (2 dtypes × 6 hdims × 2 causal) of the splitkv dispatcher inline here, and
+// each tuple instantiates ~142 kernel specialisations through the seven nested
+// SWITCH macros in `run_flash_splitkv_fwd<>` — a single-TU compile that ran
+// >30 minutes at ~18 GB RSS before being killed during PR-FA-2 development.
 //
-// candle's PR-FA-1 keeps the dispatcher dense-only (`num_splits=1`
-// is forced in the caller below); the splitkv branch from
-// v2.8.3's flash_api.cpp lands in PR-FA-2.
-void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+// The corresponding explicit instantiation definitions live in the per-hdim
+// `flash_fwd_split_hdim*_*_sm80.cu` files (e.g.
+// `template void run_mha_fwd_splitkv_dispatch<cutlass::half_t, 64, false>(...)`),
+// which compile in parallel as 24 independent TUs (~30s each on this machine).
+// The linker resolves the calls in this TU to those out-of-line definitions.
+//
+// Note: `run_mha_fwd_<>` (the dense-path counterpart) is forward-declared in
+// `flash.h` without a primary template definition; cicc therefore never tries
+// to implicitly instantiate it here, and no extern declarations are required.
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::half_t, 32, false>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::half_t, 32, true>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::half_t, 64, false>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::half_t, 64, true>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::half_t, 96, false>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::half_t, 96, true>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::half_t, 128, false>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::half_t, 128, true>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::half_t, 192, false>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::half_t, 192, true>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::half_t, 256, false>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::half_t, 256, true>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 32, false>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 32, true>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 64, false>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 64, true>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 96, false>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 96, true>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, false>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, true>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 192, false>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 192, true>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, false>(Flash_fwd_params &params, cudaStream_t stream);
+extern template void run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, true>(Flash_fwd_params &params, cudaStream_t stream);
+
+// Templated dispatch wrapper. Mirrors v2.8.3's
+// `flash_api.cpp::run_mha_fwd` — chooses between the dense
+// `run_mha_fwd_<elem_type, kHeadDim, Is_causal>` specialisation and
+// the `run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, Is_causal>`
+// specialisation based on `params.num_splits` and the explicit
+// `force_split_kernel` override (used upstream for paged-KV / cached-K
+// paths; not yet plumbed in candle but exposed for FFI symmetry).
+void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream,
+                 bool force_split_kernel = false) {
   FP16_SWITCH(!params.is_bf16, [&] {
       HEADDIM_SWITCH(params.d, [&] {
           BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-              run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
+              if (params.num_splits <= 1 && !force_split_kernel) {
+                  run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
+              } else {
+                  run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, Is_causal>(params, stream);
+              }
           });
       });
   });
@@ -85,7 +140,20 @@ extern "C" void run_mha(
     int window_size_left,
     int window_size_right,
 
-    float softcap
+    float softcap,
+
+    // PR-FA-2: split-KV dispatch surface. `num_splits<=1 && !force_split_kernel`
+    // takes the dense path (existing behavior); `num_splits>1` or
+    // `force_split_kernel != 0` enters `run_mha_fwd_splitkv_dispatch<>`. The
+    // `_accum_ptr` buffers must be fp32 of shape
+    // `(num_splits, b, h, seqlen_q[, d_rounded])`; the caller (Rust side) is
+    // responsible for allocation. Defaults of `num_splits=1`,
+    // `softmax_lseaccum_ptr=nullptr`, `oaccum_ptr=nullptr`, `force_split_kernel=0`
+    // reproduce PR-FA-1 behavior exactly.
+    int num_splits,
+    void *softmax_lseaccum_ptr,
+    void *oaccum_ptr,
+    int force_split_kernel
 ) {
     FLASH_NAMESPACE::Flash_fwd_params params;
     // Reset the parameters
@@ -155,7 +223,9 @@ extern "C" void run_mha(
     params.window_size_right = window_size_right;
 
     params.is_seqlens_k_cumulative = true;
-    params.num_splits = 1;
+    params.num_splits = num_splits;
+    params.softmax_lseaccum_ptr = softmax_lseaccum_ptr;
+    params.oaccum_ptr = oaccum_ptr;
     params.unpadded_lse = unpadded_lse;
 
     // Tripwire: candle-flash-attn does not support dropout. `philox_unpack.cuh`
@@ -175,5 +245,5 @@ extern "C" void run_mha(
     }
 
     cudaStream_t stream = 0; // Use the default stream.
-    FLASH_NAMESPACE::run_mha_fwd(params, stream);
+    FLASH_NAMESPACE::run_mha_fwd(params, stream, force_split_kernel != 0);
 }
