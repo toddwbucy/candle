@@ -142,6 +142,61 @@ fn flash_attn_acausal_softcap() -> Result<()> {
 }
 
 #[test]
+fn flash_attn_acausal_splitkv() -> Result<()> {
+    // Shape designed to enter the splitkv dispatch path on any modern CUDA
+    // GPU (sm80+) per the heuristic ported from upstream FA v2.8.3 in
+    // PR-FA-3: batch * heads * m_blocks = 1 * 2 * 1 = 2 leaves headroom
+    // under the 0.8 * num_SMs short-circuit on A6000 / 4090 / A100, and
+    // seqlen_k = 512 with head_dim = 64 produces num_n_blocks = 2 (split
+    // tile is 256 in K for hdim <= 64) — so the heuristic returns >= 2
+    // and the kernel takes the splitkv path. If the splitkv combine
+    // kernel is wrong, this test diverges from the fp32 attention
+    // reference.
+    let device = Device::new_cuda(0)?;
+    let (b, h, sq, sk, d) = (1usize, 2, 8, 512, 64);
+    let scale = 1.0f32 / (d as f32).sqrt();
+
+    // Flash-attn input layout is (batch, seq, heads, head_dim).
+    let q = (Tensor::arange(0u32, (b * sq * h * d) as u32, &device)?
+        .to_dtype(DType::F16)?
+        .reshape((b, sq, h, d))?
+        / 1024.)?;
+    let k = (Tensor::arange(0u32, (b * sk * h * d) as u32, &device)?
+        .to_dtype(DType::F16)?
+        .reshape((b, sk, h, d))?
+        / 4096.)?;
+    let v = (Tensor::arange(0u32, (b * sk * h * d) as u32, &device)?
+        .to_dtype(DType::F16)?
+        .reshape((b, sk, h, d))?
+        / 8192.)?;
+
+    // Reference attention: collapse (batch, heads) into a single batch axis
+    // so `fa_acausal`'s rank-3 matmul matches per-head, then unflatten.
+    let ys_ref = {
+        let qref = q.transpose(1, 2)?.contiguous()?.reshape((b * h, sq, d))?;
+        let kref = k.transpose(1, 2)?.contiguous()?.reshape((b * h, sk, d))?;
+        let vref = v.transpose(1, 2)?.contiguous()?.reshape((b * h, sk, d))?;
+        fa_acausal(&qref, &kref, &vref, scale)?
+            .reshape((b, h, sq, d))?
+            .transpose(1, 2)?
+            .contiguous()?
+    };
+
+    let ys = candle_flash_attn::flash_attn(&q, &k, &v, scale, false)?;
+
+    let ys = ys.to_dtype(DType::F32)?;
+    let ys_ref = ys_ref.to_dtype(DType::F32)?;
+    let diff = ys.sub(&ys_ref)?.abs()?.flatten_all()?.max(0)?;
+    assert_eq!(ys.dims(), &[b, sq, h, d]);
+    let diff_v = diff.to_vec0::<f32>()?;
+    assert!(
+        diff_v < 5e-3,
+        "splitkv vs fa_acausal max abs diff = {diff_v} (expected < 5e-3)"
+    );
+    Ok(())
+}
+
+#[test]
 fn flash_attn_varlen() -> Result<()> {
     let device = Device::new_cuda(0)?;
     let q = Tensor::arange(0u32, 48, &device)?
