@@ -255,6 +255,31 @@ impl Device {
         Ok(Self::Cuda(crate::CudaDevice::new_with_stream(ordinal)?))
     }
 
+    /// Enable bidirectional peer access between two CUDA devices on
+    /// different ordinals so GPU-direct cross-card tensor operations
+    /// (`Tensor::to_device(&other_cuda)` →
+    /// `cudarc::CudaStream::clone_dtod` → `memcpy_peer_async`) succeed.
+    ///
+    /// Idempotent: same-ordinal pairs and already-enabled pairs both
+    /// return `Ok(())`. See
+    /// [`crate::CudaDevice::enable_peer_access`] for the underlying
+    /// semantics.
+    ///
+    /// Returns an error if either device is not CUDA (e.g. `Cpu` or
+    /// `Metal`), or if the underlying driver call rejects the request
+    /// (peer access unsupported on this hardware pair, etc.).
+    #[cfg(feature = "cuda")]
+    pub fn enable_peer_access(&self, other: &Self) -> Result<()> {
+        match (self, other) {
+            (Self::Cuda(a), Self::Cuda(b)) => a.enable_peer_access(b),
+            _ => crate::bail!(
+                "enable_peer_access requires two CUDA devices, got {:?} and {:?}",
+                self.location(),
+                other.location()
+            ),
+        }
+    }
+
     pub fn new_metal(ordinal: usize) -> Result<Self> {
         Ok(Self::Metal(crate::MetalDevice::new(ordinal)?))
     }
