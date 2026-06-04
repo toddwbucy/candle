@@ -329,7 +329,15 @@ impl Model {
         for b in 0..b_sz {
             mask.push(attn_mask.i((b, ..))?.expand((1, 1, sql_len, sql_len))?);
         }
-        let mask = Tensor::cat(&mask, 0)?;
+        let padding_mask = Tensor::cat(&mask, 0)?;
+        // Combine the padding mask with a lower-triangular causal mask so a query
+        // at position i cannot attend to future keys j > i (issue #3567).
+        let causal: Vec<f32> = (0..sql_len)
+            .flat_map(|i| (0..sql_len).map(move |j| if j <= i { 1f32 } else { 0f32 }))
+            .collect();
+        let causal = Tensor::from_slice(&causal, (1, 1, sql_len, sql_len), &self.device)?
+            .to_dtype(padding_mask.dtype())?;
+        let mask = padding_mask.broadcast_mul(&causal)?;
         let on_true = mask.zeros_like()?.to_dtype(self.dtype)?;
         let on_false = Tensor::new(f32::NEG_INFINITY, &self.device)?
             .broadcast_as(mask.shape())?
@@ -398,5 +406,58 @@ impl ModelForCausalLM {
 
     pub fn clear_kv_cache(&mut self) {
         self.base_model.clear_kv_cache()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_config() -> Config {
+        Config {
+            vocab_size: 16,
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            max_position_embeddings: 16,
+            sliding_window: 4096,
+            max_window_layers: 0,
+            tie_word_embeddings: false,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-6,
+            use_sliding_window: false,
+            hidden_act: Activation::Silu,
+        }
+    }
+
+    // Regression for #3567: when a padding mask is provided the attention mask
+    // must still be causal - a query at position i may not attend to keys j > i.
+    #[test]
+    fn attention_mask_is_causal() -> Result<()> {
+        let dev = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &dev);
+        let model = Model::new(&tiny_config(), vb)?;
+        // One sequence of length 4, no padding (all ones). Padding masks are
+        // integer-valued (where_cond requires an integer condition).
+        let attn = Tensor::ones((1, 4), DType::U8, &dev)?;
+        let mask = model
+            .prepare_attention_mask(&attn)?
+            .i((0, 0))?
+            .to_vec2::<f32>()?;
+        for (i, row) in mask.iter().enumerate() {
+            for (j, &v) in row.iter().enumerate() {
+                if j > i {
+                    assert!(
+                        v.is_infinite() && v < 0.0,
+                        "future key ({i},{j}) not masked"
+                    );
+                } else {
+                    assert_eq!(v, 0.0, "({i},{j}) wrongly masked");
+                }
+            }
+        }
+        Ok(())
     }
 }
