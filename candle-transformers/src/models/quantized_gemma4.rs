@@ -8,9 +8,11 @@
 //! global layers use a larger head dim, fewer KV heads, a proportional RoPE,
 //! and share value with key (`attention_k_eq_v`, no separate v_proj).
 //!
-//! Status: Phase A - attention + dense feedforward only. The sparse MoE branch
-//! (router + 128 experts + per-layer scales) is added in Phase B; until then
-//! this runs the `enable_moe_block = false` dense path.
+//! Each layer runs a dense feedforward and (when `enable_moe_block`) a sparse
+//! MoE feedforward in parallel: the dense MLP and a 128-expert/8-active router
+//! both read the post-attention residual, their outputs are normalized and
+//! summed, then scaled by a per-layer scalar. The MoE expert GEMM uses
+//! `candle_nn::moe::moe_gemm_gguf`, which is CUDA-only.
 //!
 //! References:
 //! - [Gemma 4](https://blog.google/technology/developers/gemma-4/)
@@ -19,10 +21,11 @@ use super::quantized_qwen3::Gguf;
 use super::with_tracing::QMatMul;
 use crate::quantized_nn::RmsNorm;
 use crate::utils::repeat_kv;
-use candle::quantized::gguf_file;
+use candle::quantized::{gguf_file, QTensor};
 use candle::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use candle_nn::{Activation, Embedding};
+use candle_nn::{moe, Activation, Embedding, Linear};
 use std::io::{Read, Seek};
+use std::sync::Arc;
 
 // Gemma 4 global (full_attention) layers use a proportional RoPE with this
 // partial rotary factor; it is an architectural constant (HF config:
@@ -102,12 +105,13 @@ impl RotaryEmbedding {
     }
 }
 
-/// Weightless RMS normalization (Gemma 4 normalizes V with no learned weight).
-fn v_norm(v: &Tensor, eps: f64) -> Result<Tensor> {
-    let dtype = v.dtype();
-    let v = v.to_dtype(DType::F32)?;
-    let rms = (v.sqr()?.mean_keepdim(D::Minus1)? + eps)?.sqrt()?;
-    v.broadcast_div(&rms)?.to_dtype(dtype)
+/// Weightless RMS normalization over the last dim (Gemma 4 normalizes V and the
+/// router input with no learned weight).
+fn rms_no_scale(x: &Tensor, eps: f64) -> Result<Tensor> {
+    let dtype = x.dtype();
+    let x = x.to_dtype(DType::F32)?;
+    let rms = (x.sqr()?.mean_keepdim(D::Minus1)? + eps)?.sqrt()?;
+    x.broadcast_div(&rms)?.to_dtype(dtype)
 }
 
 // ── Attention ───────────────────────────────────────────────────────────────
@@ -195,7 +199,7 @@ impl Attention {
         // Per-head Q/K RMSNorm, then weightless V norm.
         let q = self.q_norm.forward(&q)?;
         let k = self.k_norm.forward(&k)?;
-        let v = v_norm(&v, self.rms_norm_eps)?;
+        let v = rms_no_scale(&v, self.rms_norm_eps)?;
 
         let (q, k) = (q.to_dtype(self.dtype)?, k.to_dtype(self.dtype)?);
         let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
@@ -264,7 +268,137 @@ impl Module for Mlp {
     }
 }
 
-// ── Decoder layer (Phase A: dense feedforward only) ──────────────────────────
+// ── Sparse MoE feedforward (router + 128 fused experts) ──────────────────────
+
+struct Gemma4Moe {
+    // Router (own weightless RMSNorm + learned per-dim scale + scalar_root_size).
+    router_proj: Linear,      // ffn_gate_inp.weight  [num_experts, hidden]
+    router_scale: Tensor,     // ffn_gate_inp.scale   [hidden]
+    per_expert_scale: Tensor, // ffn_down_exps.scale [num_experts]
+    scalar_root_size: f64,    // hidden^-0.5
+    eps: f64,
+    // Experts (quantized, gate/up fused into one tensor per layer).
+    gate_up_exps: Arc<QTensor>, // [num_experts, 2*moe_inter, hidden]
+    down_exps: Arc<QTensor>,    // [num_experts, hidden, moe_inter]
+    moe_inter: usize,
+    num_experts_per_tok: usize,
+    act: Activation,
+    dtype: DType,
+}
+
+impl Gemma4Moe {
+    fn load<R: Read + Seek>(
+        gg: &mut Gguf<R>,
+        prefix: &str,
+        hidden_size: usize,
+        moe_inter: usize,
+        num_experts_per_tok: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Option<Self>> {
+        // Present only on MoE (enable_moe_block) layers.
+        let gate_up = match gg.tensor(&format!("{prefix}.ffn_gate_up_exps.weight")) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+        let router_proj_w = gg
+            .tensor(&format!("{prefix}.ffn_gate_inp.weight"))?
+            .dequantize(device)?
+            .to_dtype(DType::F32)?;
+        let router_scale = gg
+            .tensor(&format!("{prefix}.ffn_gate_inp.scale"))?
+            .dequantize(device)?
+            .to_dtype(DType::F32)?;
+        let per_expert_scale = gg
+            .tensor(&format!("{prefix}.ffn_down_exps.scale"))?
+            .dequantize(device)?
+            .to_dtype(DType::F32)?;
+        let down_exps = gg.tensor(&format!("{prefix}.ffn_down_exps.weight"))?;
+        Ok(Some(Self {
+            router_proj: Linear::new(router_proj_w, None),
+            router_scale,
+            per_expert_scale,
+            scalar_root_size: (hidden_size as f64).powf(-0.5),
+            eps: 0.0, // set by caller via with_eps
+            gate_up_exps: Arc::new(gate_up),
+            down_exps: Arc::new(down_exps),
+            moe_inter,
+            num_experts_per_tok,
+            act: Activation::GeluPytorchTanh,
+            dtype,
+        }))
+    }
+
+    fn with_eps(mut self, eps: f64) -> Self {
+        self.eps = eps;
+        self
+    }
+
+    /// `router_in`: raw post-attention residual (flat `[tokens, hidden]`).
+    /// `expert_in`: `pre_feedforward_layernorm_2(residual)` (flat `[tokens, hidden]`).
+    fn forward(&self, router_in: &Tensor, expert_in: &Tensor, is_prefill: bool) -> Result<Tensor> {
+        let k = self.num_experts_per_tok;
+
+        // Router (in f32 for stability): weightless RMSNorm, per-dim scale,
+        // scalar_root_size, softmax over all experts, top-k, renormalize,
+        // per-expert scale.
+        let h = rms_no_scale(&router_in.to_dtype(DType::F32)?, self.eps)?;
+        let h = h.broadcast_mul(&self.router_scale)?;
+        let h = (h * self.scalar_root_size)?;
+        let scores = self.router_proj.forward(&h)?;
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let topk_idx = probs
+            .arg_sort_last_dim(false)?
+            .narrow(D::Minus1, 0, k)?
+            .contiguous()?;
+        let topk_w = probs.gather(&topk_idx, D::Minus1)?;
+        let topk_w = topk_w.broadcast_div(&topk_w.sum_keepdim(D::Minus1)?)?;
+        let pes = self
+            .per_expert_scale
+            .index_select(&topk_idx.flatten_all()?, 0)?
+            .reshape(topk_idx.shape())?;
+        let topk_w = (topk_w * pes)?;
+
+        // Experts: grouped quantized GEMM. moe_gemm_gguf takes F32 activations and
+        // the model dtype as its compute precision (it dequantizes the experts to
+        // that dtype). Fused gate_up -> chunk -> gelu(gate)*up -> down.
+        let xs = expert_in.to_dtype(DType::F32)?;
+        let num_tokens = xs.dim(0)?;
+        let hidden = xs.dim(1)?;
+        let (expert_ids, sorted_token_ids) = topk_idx.flatten_all()?.sort_last_dim(true)?;
+        let gate_up = moe::moe_gemm_gguf(
+            &xs,
+            &self.gate_up_exps,
+            &None,
+            &sorted_token_ids,
+            &expert_ids,
+            k,
+            is_prefill,
+            // moe_gemm_gguf's CUDA kernel requires BF16 compute (F32 in/out).
+            DType::BF16,
+        )?;
+        let gate = gate_up.narrow(D::Minus1, 0, self.moe_inter)?;
+        let up = gate_up.narrow(D::Minus1, self.moe_inter, self.moe_inter)?;
+        let down_in = (up * gate.apply(&self.act)?)?;
+        let ys = moe::moe_gemm_gguf(
+            &down_in,
+            &self.down_exps,
+            &Some(topk_w),
+            &sorted_token_ids,
+            &expert_ids,
+            k,
+            is_prefill,
+            // moe_gemm_gguf's CUDA kernel requires BF16 compute (F32 in/out).
+            DType::BF16,
+        )?;
+        // Sum the per-token top-k expert contributions, back to the model dtype.
+        ys.reshape((num_tokens, (), hidden))?
+            .sum(D::Minus2)?
+            .to_dtype(self.dtype)
+    }
+}
+
+// ── Decoder layer (attention + dense feedforward, optional sparse MoE) ────────
 
 struct DecoderLayer {
     self_attn: Attention,
@@ -273,18 +407,29 @@ struct DecoderLayer {
     post_attention_layernorm: RmsNorm,
     pre_feedforward_layernorm: RmsNorm,
     post_feedforward_layernorm: RmsNorm,
+    // MoE branch (None on dense layers).
+    moe: Option<Gemma4Moe>,
+    pre_feedforward_layernorm_2: Option<RmsNorm>,
+    post_feedforward_layernorm_1: Option<RmsNorm>,
+    post_feedforward_layernorm_2: Option<RmsNorm>,
+    layer_scalar: Tensor,
 }
 
 impl DecoderLayer {
+    #[allow(clippy::too_many_arguments)]
     fn load<R: Read + Seek>(
         gg: &mut Gguf<R>,
         prefix: &str,
         n_head: usize,
         n_kv_head: usize,
         head_dim: usize,
+        hidden_size: usize,
+        moe_inter: usize,
+        num_experts_per_tok: usize,
         rms_norm_eps: f64,
         rotary_emb: RotaryEmbedding,
         dtype: DType,
+        device: &Device,
     ) -> Result<Self> {
         let self_attn = Attention::load(
             gg,
@@ -306,6 +451,35 @@ impl DecoderLayer {
             gg.rms_norm(&format!("{prefix}.ffn_norm.weight"), rms_norm_eps)?;
         let post_feedforward_layernorm =
             gg.rms_norm(&format!("{prefix}.post_ffw_norm.weight"), rms_norm_eps)?;
+
+        let moe = Gemma4Moe::load(
+            gg,
+            prefix,
+            hidden_size,
+            moe_inter,
+            num_experts_per_tok,
+            dtype,
+            device,
+        )?
+        .map(|m| m.with_eps(rms_norm_eps));
+        let (
+            pre_feedforward_layernorm_2,
+            post_feedforward_layernorm_1,
+            post_feedforward_layernorm_2,
+        ) = if moe.is_some() {
+            (
+                Some(gg.rms_norm(&format!("{prefix}.pre_ffw_norm_2.weight"), rms_norm_eps)?),
+                Some(gg.rms_norm(&format!("{prefix}.post_ffw_norm_1.weight"), rms_norm_eps)?),
+                Some(gg.rms_norm(&format!("{prefix}.post_ffw_norm_2.weight"), rms_norm_eps)?),
+            )
+        } else {
+            (None, None, None)
+        };
+        let layer_scalar = gg
+            .tensor(&format!("{prefix}.layer_output_scale.weight"))?
+            .dequantize(device)?
+            .to_dtype(dtype)?;
+
         Ok(Self {
             self_attn,
             mlp,
@@ -313,11 +487,16 @@ impl DecoderLayer {
             post_attention_layernorm,
             pre_feedforward_layernorm,
             post_feedforward_layernorm,
+            moe,
+            pre_feedforward_layernorm_2,
+            post_feedforward_layernorm_1,
+            post_feedforward_layernorm_2,
+            layer_scalar,
         })
     }
 
-    /// Attention sub-block; returns the post-attention residual (Phase A parity
-    /// checkpoint, computed before the feedforward block).
+    /// Attention sub-block; returns the post-attention residual (also the Phase A
+    /// parity checkpoint, computed before the feedforward block).
     fn forward_attn(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
         let residual = x;
         let x = self.input_layernorm.forward(x)?;
@@ -326,15 +505,55 @@ impl DecoderLayer {
         residual + x
     }
 
-    fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+    fn forward(
+        &mut self,
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        offset: usize,
+        is_prefill: bool,
+    ) -> Result<Tensor> {
         let x = self.forward_attn(x, mask, offset)?;
-        // Phase A dense path == gemma4 enable_moe_block=false:
-        //   post_ffw_norm(mlp(pre_ffw_norm(x))) + x
         let residual = &x;
-        let h = self.pre_feedforward_layernorm.forward(&x)?;
-        let h = self.mlp.forward(&h)?;
-        let h = self.post_feedforward_layernorm.forward(&h)?;
-        residual + h
+
+        // Dense feedforward branch.
+        let dense = self
+            .mlp
+            .forward(&self.pre_feedforward_layernorm.forward(&x)?)?;
+
+        let combined = match &self.moe {
+            None => dense,
+            Some(moe) => {
+                // Dual feedforward: dense and MoE both read the post-attention
+                // residual; the MoE router reads the raw residual, the experts
+                // read pre_feedforward_layernorm_2(residual).
+                let (b, seq, hidden) = x.dims3()?;
+                let dense1 = self
+                    .post_feedforward_layernorm_1
+                    .as_ref()
+                    .unwrap()
+                    .forward(&dense)?;
+                let router_in = x.reshape(((), hidden))?;
+                let expert_in = self
+                    .pre_feedforward_layernorm_2
+                    .as_ref()
+                    .unwrap()
+                    .forward(&x)?
+                    .reshape(((), hidden))?;
+                let moe_out = moe
+                    .forward(&router_in, &expert_in, is_prefill)?
+                    .reshape((b, seq, hidden))?;
+                let moe2 = self
+                    .post_feedforward_layernorm_2
+                    .as_ref()
+                    .unwrap()
+                    .forward(&moe_out)?;
+                (dense1 + moe2)?
+            }
+        };
+
+        let combined = self.post_feedforward_layernorm.forward(&combined)?;
+        let x = (residual + combined)?;
+        x.broadcast_mul(&self.layer_scalar)
     }
 
     fn clear_kv_cache(&mut self) {
@@ -354,6 +573,7 @@ pub struct ModelWeights {
     output: QMatMul,
     final_logit_softcapping: Option<f64>,
     device: Device,
+    dtype: DType,
 }
 
 impl ModelWeights {
@@ -379,6 +599,9 @@ impl ModelWeights {
         let key_length_swa = md_u32(&gg, &format!("{arch}.attention.key_length_swa"))? as usize;
         let sliding_window = md_u32(&gg, &format!("{arch}.attention.sliding_window"))? as usize;
         let context_length = md_u32(&gg, &format!("{arch}.context_length"))? as usize;
+        // MoE: expert intermediate size and active experts per token.
+        let moe_inter = md_u32(&gg, &format!("{arch}.expert_feed_forward_length"))? as usize;
+        let num_experts_per_tok = md_u32(&gg, &format!("{arch}.expert_used_count"))? as usize;
         let rms_norm_eps = match gg
             .metadata()
             .get(&format!("{arch}.attention.layer_norm_rms_epsilon"))
@@ -460,9 +683,13 @@ impl ModelWeights {
                 n_head,
                 n_kv_head,
                 head_dim,
+                embedding_length,
+                moe_inter,
+                num_experts_per_tok,
                 rms_norm_eps,
                 rotary_emb,
                 dtype,
+                device,
             )?);
         }
 
@@ -476,6 +703,7 @@ impl ModelWeights {
             output,
             final_logit_softcapping,
             device: device.clone(),
+            dtype,
         })
     }
 
@@ -513,7 +741,7 @@ impl ModelWeights {
 
     fn embed(&self, input: &Tensor) -> Result<Tensor> {
         let xs = self.tok_embeddings.forward(input)?;
-        xs * (self.embedding_length as f64).sqrt()
+        (xs * (self.embedding_length as f64).sqrt())?.to_dtype(self.dtype)
     }
 
     fn masks(
@@ -532,6 +760,7 @@ impl ModelWeights {
 
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let (_b, seq_len) = input.dims2()?;
+        let is_prefill = seq_len > 1;
         let mut xs = self.embed(input)?;
         // Masks are additive f32 (-inf / 0); attention casts them to its compute dtype.
         let (full_mask, sliding_mask) = self.masks(seq_len, offset, DType::F32)?;
@@ -541,7 +770,7 @@ impl ModelWeights {
             } else {
                 full_mask.as_ref()
             };
-            xs = layer.forward(&xs, mask, offset)?;
+            xs = layer.forward(&xs, mask, offset, is_prefill)?;
         }
         let xs = xs.i((.., seq_len - 1, ..))?;
         let logits = self.output.forward(&self.norm.forward(&xs)?)?;
@@ -549,45 +778,6 @@ impl ModelWeights {
             None => Ok(logits),
             Some(sc) => (logits / sc)?.tanh()?.affine(sc, 0.0),
         }
-    }
-
-    /// Phase A diagnostic: the scaled token embedding (input to layer 0).
-    pub fn debug_scaled_embed(&self, input: &Tensor) -> Result<Tensor> {
-        self.embed(input)
-    }
-
-    /// Phase A verification hook: run a single layer's attention sub-block on a
-    /// supplied hidden state `[batch, seq, hidden]`, returning the post-attention
-    /// residual. Lets a mid-stack layer (e.g. a global/full layer) be validated
-    /// in isolation against a reference, independent of the (Phase A) feedforward.
-    pub fn debug_layer_post_attn(
-        &mut self,
-        hidden: &Tensor,
-        layer_idx: usize,
-        offset: usize,
-    ) -> Result<Tensor> {
-        let (_b, seq_len, _) = hidden.dims3()?;
-        let (full_mask, sliding_mask) = self.masks(seq_len, offset, DType::F32)?;
-        let mask = if self.is_sliding[layer_idx] {
-            sliding_mask.as_ref()
-        } else {
-            full_mask.as_ref()
-        };
-        self.layers[layer_idx].forward_attn(hidden, mask, offset)
-    }
-
-    /// Phase A verification hook: embedding + layer-0 attention sub-block only,
-    /// returning the post-attention residual `[batch, seq, hidden]`.
-    pub fn debug_layer0_post_attn(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
-        let (_b, seq_len) = input.dims2()?;
-        let xs = self.embed(input)?;
-        let (full_mask, sliding_mask) = self.masks(seq_len, offset, DType::F32)?;
-        let mask = if self.is_sliding[0] {
-            sliding_mask.as_ref()
-        } else {
-            full_mask.as_ref()
-        };
-        self.layers[0].forward_attn(&xs, mask, offset)
     }
 
     pub fn clear_kv_cache(&mut self) {
