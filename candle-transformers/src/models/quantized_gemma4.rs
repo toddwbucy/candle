@@ -114,6 +114,38 @@ fn rms_no_scale(x: &Tensor, eps: f64) -> Result<Tensor> {
     x.broadcast_div(&rms)?.to_dtype(dtype)
 }
 
+// ── KV cache ─────────────────────────────────────────────────────────────────
+
+/// Per-layer KV cache. Global (full_attention) layers attend to the whole past,
+/// so an unbounded concat cache is correct. Sliding (local) layers must only
+/// attend within `sliding_window`, so they use a window-bounded rotating cache
+/// (which also provides the matching attention mask).
+enum KvCache {
+    Full(Option<(Tensor, Tensor)>),
+    Sliding(candle_nn::kv_cache::RotatingKvCache),
+}
+
+impl KvCache {
+    fn reset(&mut self) {
+        match self {
+            KvCache::Full(c) => *c = None,
+            KvCache::Sliding(c) => c.reset(),
+        }
+    }
+}
+
+/// Convert a boolean keep/mask tensor (1 = mask out) into an additive
+/// `(1, 1, seq, kv)` mask of -inf / 0 for `broadcast_add` onto attention scores.
+fn additive_mask(bool_mask: &Tensor, dtype: DType, device: &Device) -> Result<Tensor> {
+    let (sl, kl) = bool_mask.dims2()?;
+    let neg = Tensor::new(f32::NEG_INFINITY, device)?.broadcast_as((sl, kl))?;
+    let zero = Tensor::zeros((sl, kl), DType::F32, device)?;
+    bool_mask
+        .where_cond(&neg, &zero)?
+        .reshape((1, 1, sl, kl))?
+        .to_dtype(dtype)
+}
+
 // ── Attention ───────────────────────────────────────────────────────────────
 
 struct Attention {
@@ -130,7 +162,7 @@ struct Attention {
     num_kv_groups: usize,
     rms_norm_eps: f64,
     rotary_emb: RotaryEmbedding,
-    kv_cache: Option<(Tensor, Tensor)>,
+    kv_cache: KvCache,
     dtype: DType,
 }
 
@@ -142,6 +174,8 @@ impl Attention {
         n_head: usize,
         n_kv_head: usize,
         head_dim: usize,
+        sliding: bool,
+        sliding_window: usize,
         rms_norm_eps: f64,
         rotary_emb: RotaryEmbedding,
         dtype: DType,
@@ -153,6 +187,12 @@ impl Attention {
         let o_proj = gg.qmatmul(&format!("{prefix}.attn_output.weight"))?;
         let q_norm = gg.rms_norm(&format!("{prefix}.attn_q_norm.weight"), rms_norm_eps)?;
         let k_norm = gg.rms_norm(&format!("{prefix}.attn_k_norm.weight"), rms_norm_eps)?;
+        // Sliding layers bound their cache to the window (seq is dim 2 of k/v).
+        let kv_cache = if sliding {
+            KvCache::Sliding(candle_nn::kv_cache::RotatingKvCache::new(2, sliding_window))
+        } else {
+            KvCache::Full(None)
+        };
         Ok(Self {
             q_proj,
             k_proj,
@@ -166,7 +206,7 @@ impl Attention {
             num_kv_groups: n_head / n_kv_head,
             rms_norm_eps,
             rotary_emb,
-            kv_cache: None,
+            kv_cache,
             dtype,
         })
     }
@@ -205,16 +245,39 @@ impl Attention {
         let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
         let v = v.to_dtype(self.dtype)?;
 
-        // offset == 0 starts a fresh sequence: ignore any stale cache.
-        let (k, v) = match &self.kv_cache {
-            Some((k_cache, v_cache)) if offset > 0 => {
-                let k = Tensor::cat(&[k_cache, &k], 2)?;
-                let v = Tensor::cat(&[v_cache, &v], 2)?;
-                (k, v)
+        // offset == 0 starts a fresh sequence: drop any stale cache.
+        if offset == 0 {
+            self.kv_cache.reset();
+        }
+        // Extend the cache and obtain the effective mask. Global layers use the
+        // caller-supplied full causal mask; sliding layers bound the cache to the
+        // window and use the matching mask from the rotating cache.
+        let (k, v, eff_mask) = match &mut self.kv_cache {
+            KvCache::Full(slot) => {
+                let (k, v) = match slot {
+                    Some((k_cache, v_cache)) => {
+                        let k = Tensor::cat(&[&*k_cache, &k], 2)?;
+                        let v = Tensor::cat(&[&*v_cache, &v], 2)?;
+                        (k, v)
+                    }
+                    None => (k, v),
+                };
+                *slot = Some((k.clone(), v.clone()));
+                (k, v, mask.map(|m| m.clone()))
             }
-            _ => (k, v),
+            KvCache::Sliding(cache) => {
+                // attn_mask reflects the state *after* appending seq_len, so it is
+                // queried before append; None on single-token decode (the bounded
+                // cache already holds only in-window keys).
+                let bool_mask = cache.attn_mask(seq_len, x.device())?;
+                let (k, v) = cache.append(&k, &v)?;
+                let m = match bool_mask {
+                    Some(bm) => Some(additive_mask(&bm, self.dtype, x.device())?),
+                    None => None,
+                };
+                (k, v, m)
+            }
         };
-        self.kv_cache = Some((k.clone(), v.clone()));
 
         let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
         let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
@@ -222,7 +285,7 @@ impl Attention {
         // Gemma 4 attention uses scaling = 1.0 (not 1/sqrt(head_dim)); the per-head
         // Q/K RMSNorms control the logit magnitude.
         let mut scores = q.matmul(&k.transpose(2, 3)?)?;
-        if let Some(mask) = mask {
+        if let Some(mask) = eff_mask {
             scores = scores.broadcast_add(&mask.to_dtype(scores.dtype())?)?;
         }
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
@@ -235,7 +298,7 @@ impl Attention {
     }
 
     fn clear_kv_cache(&mut self) {
-        self.kv_cache = None;
+        self.kv_cache.reset();
     }
 }
 
@@ -423,6 +486,8 @@ impl DecoderLayer {
         n_head: usize,
         n_kv_head: usize,
         head_dim: usize,
+        sliding: bool,
+        sliding_window: usize,
         hidden_size: usize,
         moe_inter: usize,
         num_experts_per_tok: usize,
@@ -437,6 +502,8 @@ impl DecoderLayer {
             n_head,
             n_kv_head,
             head_dim,
+            sliding,
+            sliding_window,
             rms_norm_eps,
             rotary_emb,
             dtype,
@@ -567,8 +634,6 @@ pub struct ModelWeights {
     tok_embeddings: Embedding,
     embedding_length: usize,
     layers: Vec<DecoderLayer>,
-    is_sliding: Vec<bool>,
-    sliding_window: usize,
     norm: RmsNorm,
     output: QMatMul,
     final_logit_softcapping: Option<f64>,
@@ -683,6 +748,8 @@ impl ModelWeights {
                 n_head,
                 n_kv_head,
                 head_dim,
+                sliding,
+                sliding_window,
                 embedding_length,
                 moe_inter,
                 num_experts_per_tok,
@@ -697,8 +764,6 @@ impl ModelWeights {
             tok_embeddings,
             embedding_length,
             layers,
-            is_sliding,
-            sliding_window,
             norm,
             output,
             final_logit_softcapping,
@@ -707,26 +772,16 @@ impl ModelWeights {
         })
     }
 
-    /// Causal mask (additive, 0 keep / -inf masked). `window` bounds the local
-    /// context for sliding layers.
-    fn causal_mask(
-        &self,
-        seq_len: usize,
-        offset: usize,
-        window: Option<usize>,
-        dtype: DType,
-    ) -> Result<Tensor> {
+    /// Full causal mask (additive f32, 0 keep / -inf future), shape
+    /// `(1, 1, seq_len, seq_len + offset)`. Used by global/full_attention layers;
+    /// sliding layers derive their own (window-aware) mask from the rotating cache.
+    /// Returns None for single-token decode.
+    fn causal_mask(&self, seq_len: usize, offset: usize) -> Result<Option<Tensor>> {
+        if seq_len == 1 {
+            return Ok(None);
+        }
         let mask: Vec<f32> = (0..seq_len)
-            .flat_map(|i| {
-                (0..seq_len).map(move |j| {
-                    let masked = j > i || window.map(|w| i >= j + w).unwrap_or(false);
-                    if masked {
-                        f32::NEG_INFINITY
-                    } else {
-                        0.0
-                    }
-                })
-            })
+            .flat_map(|i| (0..seq_len).map(move |j| if j > i { f32::NEG_INFINITY } else { 0.0 }))
             .collect();
         let mask = Tensor::from_slice(&mask, (seq_len, seq_len), &self.device)?;
         let mask = if offset > 0 {
@@ -735,8 +790,7 @@ impl ModelWeights {
         } else {
             mask
         };
-        mask.expand((1, 1, seq_len, seq_len + offset))?
-            .to_dtype(dtype)
+        Ok(Some(mask.expand((1, 1, seq_len, seq_len + offset))?))
     }
 
     fn embed(&self, input: &Tensor) -> Result<Tensor> {
@@ -744,33 +798,14 @@ impl ModelWeights {
         (xs * (self.embedding_length as f64).sqrt())?.to_dtype(self.dtype)
     }
 
-    fn masks(
-        &self,
-        seq_len: usize,
-        offset: usize,
-        dtype: DType,
-    ) -> Result<(Option<Tensor>, Option<Tensor>)> {
-        if seq_len == 1 {
-            return Ok((None, None));
-        }
-        let full = self.causal_mask(seq_len, offset, None, dtype)?;
-        let sliding = self.causal_mask(seq_len, offset, Some(self.sliding_window), dtype)?;
-        Ok((Some(full), Some(sliding)))
-    }
-
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let (_b, seq_len) = input.dims2()?;
         let is_prefill = seq_len > 1;
         let mut xs = self.embed(input)?;
-        // Masks are additive f32 (-inf / 0); attention casts them to its compute dtype.
-        let (full_mask, sliding_mask) = self.masks(seq_len, offset, DType::F32)?;
-        for (idx, layer) in self.layers.iter_mut().enumerate() {
-            let mask = if self.is_sliding[idx] {
-                sliding_mask.as_ref()
-            } else {
-                full_mask.as_ref()
-            };
-            xs = layer.forward(&xs, mask, offset, is_prefill)?;
+        // Full causal mask for global layers; sliding layers self-mask and ignore it.
+        let mask = self.causal_mask(seq_len, offset)?;
+        for layer in self.layers.iter_mut() {
+            xs = layer.forward(&xs, mask.as_ref(), offset, is_prefill)?;
         }
         let xs = xs.i((.., seq_len - 1, ..))?;
         let logits = self.output.forward(&self.norm.forward(&xs)?)?;
