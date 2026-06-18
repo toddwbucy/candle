@@ -846,6 +846,34 @@ impl ModelWeights {
         }
     }
 
+    /// Forward pass that also returns the residual stream at each decoder layer.
+    ///
+    /// The second element holds one tensor per layer, in layer order, each the
+    /// post-block hidden state shaped (batch, seq, hidden) before the final norm.
+    /// This is opt-in: the regular forward path is unchanged and captures nothing.
+    pub fn forward_with_intermediates(
+        &mut self,
+        input: &Tensor,
+        offset: usize,
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        let (_b, seq_len) = input.dims2()?;
+        let is_prefill = seq_len > 1;
+        let mut xs = self.embed(input)?;
+        let mask = self.causal_mask(seq_len, offset)?;
+        let mut intermediates = Vec::with_capacity(self.layers.len());
+        for layer in self.layers.iter_mut() {
+            xs = layer.forward(&xs, mask.as_ref(), offset, is_prefill)?;
+            intermediates.push(xs.clone());
+        }
+        let last = xs.i((.., seq_len - 1, ..))?;
+        let logits = self.output.forward(&self.norm.forward(&last)?)?;
+        let logits = match self.final_logit_softcapping {
+            None => logits,
+            Some(sc) => (logits / sc)?.tanh()?.affine(sc, 0.0)?,
+        };
+        Ok((logits, intermediates))
+    }
+
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache();
