@@ -5,10 +5,11 @@
 //! is followed by a dense SwiGLU MLP. The attention layers use partial rotary
 //! embeddings and an output gate (Qwen3-Next style).
 //!
-//! Status: Phase A - GGUF load, the gated full-attention layers, MLP, norms,
-//! partial RoPE. The Gated DeltaNet (linear-attention) layers are stubbed as a
-//! zero token-mixer (so a forward runs, exercising attention + MLP); the delta
-//! rule is added in Phase B.
+//! The Gated DeltaNet uses the recurrent gated delta rule (decay the matrix
+//! state, read by key, delta-correct, rank-1 write, read by query) with a causal
+//! depthwise conv over the qkv stream, per-v-head decay/beta gating, and a gated
+//! RMSNorm output. The GGUF stores `ssm_a` as -A directly and orders its v-heads
+//! by tiling the key heads (k0,k1,..,k0,k1,..), not interleaving.
 //!
 //! References:
 //! - HF `transformers` `qwen3_5`
@@ -217,12 +218,215 @@ impl Module for Mlp {
     }
 }
 
-// ── Token mixer (attention, or a Phase-A stub for DeltaNet layers) ───────────
+// ── Gated DeltaNet (linear attention) ────────────────────────────────────────
+
+/// L2 normalization over the last dim.
+fn l2norm(x: &Tensor) -> Result<Tensor> {
+    let denom = (x.sqr()?.sum_keepdim(D::Minus1)? + 1e-6)?.sqrt()?;
+    x.broadcast_div(&denom)
+}
+
+/// Numerically-stable softplus: relu(x) + log1p(exp(-|x|)).
+fn softplus(x: &Tensor) -> Result<Tensor> {
+    let ax = x.abs()?;
+    x.relu()? + (ax.neg()?.exp()? + 1.0)?.log()?
+}
+
+struct GatedDeltaNet {
+    qkv_proj: QMatMul,       // hidden -> key_dim*2 + value_dim
+    gate_proj: QMatMul,      // hidden -> value_dim (z)
+    beta_proj: QMatMul,      // hidden -> num_v_heads
+    a_proj: QMatMul,         // hidden -> num_v_heads
+    out_proj: QMatMul,       // value_dim -> hidden
+    dt_bias: Tensor,         // (num_v_heads) f32
+    a_log: Tensor,           // (num_v_heads) f32
+    conv_weight: Tensor,     // (conv_kernel, conv_dim) f32
+    ssm_norm_weight: Tensor, // (head_v_dim) f32
+    num_k_heads: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    key_dim: usize,
+    value_dim: usize,
+    conv_kernel: usize,
+    eps: f64,
+    dtype: DType,
+}
+
+impl GatedDeltaNet {
+    #[allow(clippy::too_many_arguments)]
+    fn load<R: Read + Seek>(
+        gg: &mut Gguf<R>,
+        prefix: &str,
+        num_k_heads: usize,
+        num_v_heads: usize,
+        state_size: usize,
+        eps: f64,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        let head_k_dim = state_size;
+        let head_v_dim = state_size;
+        let key_dim = num_k_heads * head_k_dim;
+        let value_dim = num_v_heads * head_v_dim;
+        let deq = |gg: &mut Gguf<R>, name: &str| -> Result<Tensor> {
+            gg.tensor(name)?.dequantize(device)?.to_dtype(DType::F32)
+        };
+        Ok(Self {
+            qkv_proj: gg.qmatmul(&format!("{prefix}.attn_qkv.weight"))?,
+            gate_proj: gg.qmatmul(&format!("{prefix}.attn_gate.weight"))?,
+            beta_proj: gg.qmatmul(&format!("{prefix}.ssm_beta.weight"))?,
+            a_proj: gg.qmatmul(&format!("{prefix}.ssm_alpha.weight"))?,
+            out_proj: gg.qmatmul(&format!("{prefix}.ssm_out.weight"))?,
+            dt_bias: deq(gg, &format!("{prefix}.ssm_dt.bias"))?,
+            a_log: deq(gg, &format!("{prefix}.ssm_a"))?,
+            conv_weight: deq(gg, &format!("{prefix}.ssm_conv1d.weight"))?,
+            ssm_norm_weight: deq(gg, &format!("{prefix}.ssm_norm.weight"))?,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            key_dim,
+            value_dim,
+            conv_kernel: 0, // set below from the conv weight
+            eps,
+            dtype,
+        }
+        .with_conv_kernel())
+    }
+
+    fn with_conv_kernel(mut self) -> Self {
+        // candle reverses GGUF dim order: conv_weight is (conv_dim, kernel).
+        self.conv_kernel = self.conv_weight.dim(1).unwrap_or(4);
+        self
+    }
+
+    /// Causal depthwise conv1d over channels, kernel `conv_kernel`, then SiLU.
+    /// `x`: (b, conv_dim, l). Returns (b, conv_dim, l).
+    fn causal_conv(&self, x: &Tensor) -> Result<Tensor> {
+        let l = x.dim(2)?;
+        let x_pad = x.pad_with_zeros(2, self.conv_kernel - 1, 0)?;
+        let conv_dim = x.dim(1)?;
+        let mut acc: Option<Tensor> = None;
+        for j in 0..self.conv_kernel {
+            let xj = x_pad.narrow(2, j, l)?;
+            // conv_weight is (conv_dim, kernel): tap j is column j.
+            let wj = self
+                .conv_weight
+                .narrow(1, j, 1)?
+                .reshape((1, conv_dim, 1))?;
+            let term = xj.broadcast_mul(&wj)?;
+            acc = Some(match acc {
+                None => term,
+                Some(a) => (a + term)?,
+            });
+        }
+        candle_nn::ops::silu(&acc.unwrap())
+    }
+
+    /// Recurrent gated delta rule from a zero initial state (prefill at offset 0).
+    /// q,k,v: (b, num_v_heads, l, head_dim); g,beta: (b, l, num_v_heads).
+    /// Returns (b, l, num_v_heads, head_v_dim).
+    fn delta_rule(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        g: &Tensor,
+        beta: &Tensor,
+    ) -> Result<Tensor> {
+        let (b, h, l, _) = q.dims4()?;
+        let dev = q.device();
+        let mut state = Tensor::zeros((b, h, self.head_k_dim, self.head_v_dim), DType::F32, dev)?;
+        let mut outs = Vec::with_capacity(l);
+        for t in 0..l {
+            let q_t = q.narrow(2, t, 1)?.squeeze(2)?; // (b,h,head_k)
+            let k_t = k.narrow(2, t, 1)?.squeeze(2)?;
+            let v_t = v.narrow(2, t, 1)?.squeeze(2)?; // (b,h,head_v)
+            let g_t = g
+                .narrow(1, t, 1)?
+                .squeeze(1)?
+                .exp()?
+                .reshape((b, h, 1, 1))?;
+            let beta_t = beta.narrow(1, t, 1)?.squeeze(1)?.reshape((b, h, 1))?;
+
+            // decay, read memory by key, delta correction, rank-1 write, read by query.
+            state = state.broadcast_mul(&g_t)?;
+            let k_col = k_t.unsqueeze(D::Minus1)?; // (b,h,head_k,1)
+            let kv = state.broadcast_mul(&k_col)?.sum(2)?; // (b,h,head_v)
+            let delta = (v_t - kv)?.broadcast_mul(&beta_t)?; // (b,h,head_v)
+            let update = k_col.broadcast_mul(&delta.unsqueeze(2)?)?; // (b,h,head_k,head_v)
+            state = (state + update)?;
+            let o_t = state.broadcast_mul(&q_t.unsqueeze(D::Minus1)?)?.sum(2)?; // (b,h,head_v)
+            outs.push(o_t);
+        }
+        Tensor::stack(&outs, 1) // (b, l, h, head_v)
+    }
+
+    fn forward(&self, h: &Tensor) -> Result<Tensor> {
+        let (b, l, _) = h.dims3()?;
+
+        // Projections.
+        let qkv = self.qkv_proj.forward(h)?; // (b,l,conv_dim)
+        let z = self
+            .gate_proj
+            .forward(h)?
+            .reshape((b, l, self.num_v_heads, self.head_v_dim))?; // (b,l,Hv,Dv)
+        let beta = candle_nn::ops::sigmoid(&self.beta_proj.forward(h)?.to_dtype(DType::F32)?)?; // (b,l,Hv)
+        let a = self.a_proj.forward(h)?.to_dtype(DType::F32)?; // (b,l,Hv)
+
+        // g = -exp(A_log) * softplus(a + dt_bias)   (per v-head)
+        let dt_bias = self.dt_bias.reshape((1, 1, self.num_v_heads))?;
+        let a_log = self.a_log.reshape((1, 1, self.num_v_heads))?;
+        // GGUF ssm_a already stores -A (= -exp(A_log)); use it directly.
+        let sp = softplus(&a.broadcast_add(&dt_bias)?)?;
+        let g = sp.broadcast_mul(&a_log)?; // (b,l,Hv)
+
+        // Causal conv over the qkv stream, then split into q,k,v.
+        let conv = self.causal_conv(&qkv.to_dtype(DType::F32)?.transpose(1, 2)?.contiguous()?)?;
+        let qkv = conv.transpose(1, 2)?.contiguous()?; // (b,l,conv_dim)
+        let q = qkv.narrow(D::Minus1, 0, self.key_dim)?;
+        let k = qkv.narrow(D::Minus1, self.key_dim, self.key_dim)?;
+        let v = qkv.narrow(D::Minus1, 2 * self.key_dim, self.value_dim)?;
+        let q = q.reshape((b, l, self.num_k_heads, self.head_k_dim))?;
+        let k = k.reshape((b, l, self.num_k_heads, self.head_k_dim))?;
+        let v = v.reshape((b, l, self.num_v_heads, self.head_v_dim))?;
+
+        // L2-normalize q,k; scale q. Then GQA-expand k/q heads to num_v_heads by
+        // TILING (k0,k1,..,k0,k1,..), matching the GGUF v-head/gate ordering
+        // (not interleaving as HF's repeat_interleave does in its own head order).
+        let q = (l2norm(&q)? * (1.0 / (self.head_k_dim as f64).sqrt()))?;
+        let k = l2norm(&k)?;
+        let n_rep = self.num_v_heads / self.num_k_heads;
+        let tile = |x: Tensor| -> Result<Tensor> {
+            let xt = x.transpose(1, 2)?.contiguous()?; // (b,Hk,l,D)
+            let copies: Vec<Tensor> = (0..n_rep).map(|_| xt.clone()).collect();
+            Tensor::cat(&copies, 1) // (b,Hv,l,D)
+        };
+        let q = tile(q)?;
+        let k = tile(k)?;
+        let v = v.transpose(1, 2)?.contiguous()?; // (b,Hv,l,Dv)
+
+        let core = self.delta_rule(&q, &k, &v, &g, &beta)?; // (b,l,Hv,Dv)
+
+        // Gated RMSNorm over head_v_dim, then * silu(z), then output projection.
+        let var = core.sqr()?.mean_keepdim(D::Minus1)?;
+        let normed = core.broadcast_div(&(var + self.eps)?.sqrt()?)?;
+        let w = self.ssm_norm_weight.reshape((1, 1, 1, self.head_v_dim))?;
+        let normed = normed.broadcast_mul(&w)?;
+        let gated = normed.broadcast_mul(&candle_nn::ops::silu(&z.to_dtype(DType::F32)?)?)?;
+        let gated = gated
+            .reshape((b, l, self.value_dim))?
+            .to_dtype(self.dtype)?;
+        self.out_proj.forward(&gated)
+    }
+}
+
+// ── Token mixer (gated attention or gated DeltaNet) ──────────────────────────
 
 enum TokenMixer {
     Attn(GatedAttention),
-    // Phase A: DeltaNet layers contribute nothing to the residual stream yet.
-    LinearStub,
+    Linear(GatedDeltaNet),
 }
 
 // ── Decoder layer ────────────────────────────────────────────────────────────
@@ -240,7 +444,7 @@ impl DecoderLayer {
         let h = self.input_layernorm.forward(x)?;
         let h = match &mut self.mixer {
             TokenMixer::Attn(a) => a.forward(&h, mask, offset)?,
-            TokenMixer::LinearStub => h.zeros_like()?,
+            TokenMixer::Linear(d) => d.forward(&h)?,
         };
         let x = (residual + h)?;
         let residual = &x;
@@ -301,6 +505,10 @@ impl ModelWeights {
             Some(v) => v.to_f32()? as f64,
             None => 1e7,
         };
+        // Gated DeltaNet (linear attention) dims.
+        let ssm_state_size = md_u32(&gg, &format!("{arch}.ssm.state_size"))? as usize;
+        let ssm_num_k_heads = md_u32(&gg, &format!("{arch}.ssm.group_count"))? as usize;
+        let ssm_num_v_heads = md_u32(&gg, &format!("{arch}.ssm.time_step_rank"))? as usize;
 
         let tok_embeddings = gg.tensor("token_embd.weight")?.dequantize(device)?;
         let tok_embeddings = Embedding::new(tok_embeddings, embedding_length);
@@ -334,7 +542,16 @@ impl ModelWeights {
                     dtype,
                 )?)
             } else {
-                TokenMixer::LinearStub
+                TokenMixer::Linear(GatedDeltaNet::load(
+                    &mut gg,
+                    &prefix,
+                    ssm_num_k_heads,
+                    ssm_num_v_heads,
+                    ssm_state_size,
+                    rms_norm_eps,
+                    device,
+                    dtype,
+                )?)
             };
             let mlp = Mlp::load(&mut gg, &prefix)?;
             layers.push(DecoderLayer {
@@ -380,20 +597,6 @@ impl ModelWeights {
         }
         let xs = xs.i((.., seq_len - 1, ..))?;
         self.output.forward(&self.norm.forward(&xs)?)
-    }
-
-    /// Phase A verification hook: run one decoder layer's forward on a supplied
-    /// hidden state, returning the layer output. Lets a single attention layer be
-    /// validated in isolation against a reference (teacher-forced).
-    pub fn debug_layer(
-        &mut self,
-        hidden: &Tensor,
-        layer_idx: usize,
-        offset: usize,
-    ) -> Result<Tensor> {
-        let (_b, seq_len, _) = hidden.dims3()?;
-        let mask = self.causal_mask(seq_len, offset)?;
-        self.layers[layer_idx].forward(hidden, mask.as_ref(), offset)
     }
 
     pub fn clear_kv_cache(&mut self) {
