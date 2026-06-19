@@ -448,4 +448,54 @@ impl GGUFQWenMoE {
         let xs = self.norm.forward(&xs)?;
         self.output.forward(&xs)?.to_dtype(DType::F32)?.squeeze(1)
     }
+
+    /// Forward pass that also returns the residual stream at each decoder layer.
+    ///
+    /// The second element holds one tensor per layer, in layer order, each the
+    /// post-block hidden state shaped (batch, seq, hidden) before the final norm.
+    /// The tap is the post-block residual, which is uniform regardless of expert
+    /// routing (the sparse FFN lives inside the block; the residual that feeds the
+    /// next layer is dense). Opt-in: the regular forward path is unchanged and
+    /// captures nothing; the clone does not perturb routing or the KV-cache path.
+    pub fn forward_with_intermediates(
+        &mut self,
+        x: &Tensor,
+        offset: usize,
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        let mut xs = self.tok_embeddings.forward(x)?;
+        let (b, l) = x.dims2()?;
+
+        let causal_mask = if l == 1 {
+            None
+        } else {
+            Some(self.causal_mask(b, l, offset, None)?)
+        };
+
+        let mut intermediates = Vec::with_capacity(self.layers.len());
+        for layer in self.layers.iter_mut() {
+            let x = xs;
+            let residual = &x;
+
+            let x = layer.attention_norm.forward(&x)?;
+            let attn = layer.forward_attn(&x, causal_mask.as_ref(), offset)?;
+            let x = (attn + residual)?;
+
+            // MLP
+            let residual = &x;
+            let x = layer.ffn_norm.forward(&x)?;
+            let x = layer.mlp.forward(&x, causal_mask.is_some())?;
+            let x = (x + residual)?;
+            xs = x;
+            intermediates.push(xs.clone());
+        }
+
+        let last = xs.narrow(1, l - 1, 1)?;
+        let last = self.norm.forward(&last)?;
+        let logits = self
+            .output
+            .forward(&last)?
+            .to_dtype(DType::F32)?
+            .squeeze(1)?;
+        Ok((logits, intermediates))
+    }
 }
