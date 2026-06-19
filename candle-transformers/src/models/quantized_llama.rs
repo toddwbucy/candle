@@ -594,6 +594,52 @@ impl ModelWeights {
         let _enter = self.span_output.enter();
         self.output.forward(&x)
     }
+
+    /// Forward pass that also returns the residual stream at each decoder layer.
+    ///
+    /// The second element holds one tensor per layer, in layer order, each the
+    /// post-block hidden state shaped (batch, seq, hidden) before the final norm.
+    /// The tap is the post-block residual, which is uniform whether a layer's FFN
+    /// is dense or a Mixtral-style sparse MoE (the experts live inside the block;
+    /// the residual that feeds the next layer is dense). Opt-in: the regular
+    /// forward path is unchanged and captures nothing; the clone does not perturb
+    /// the attention KV-cache path.
+    pub fn forward_with_intermediates(
+        &mut self,
+        x: &Tensor,
+        index_pos: usize,
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        let (_b_sz, seq_len) = x.dims2()?;
+        let mask = if seq_len == 1 {
+            None
+        } else {
+            Some(self.mask(seq_len, index_pos, x.device())?)
+        };
+        let _enter = self.span.enter();
+        let mut layer_in = self.tok_embeddings.forward(x)?;
+        let mut intermediates = Vec::with_capacity(self.layers.len());
+        for layer in self.layers.iter_mut() {
+            let x = layer_in;
+            let residual = &x;
+            let x = layer.attention_norm.forward(&x)?;
+            let attn = layer.forward_attn(&x, mask.as_ref(), index_pos)?;
+            let x = (attn + residual)?;
+
+            // MLP
+            let _enter = layer.span_mlp.enter();
+            let residual = &x;
+            let x = layer.ffn_norm.forward(&x)?;
+            let x = layer.mlp_or_moe.forward(&x)?;
+            let x = (x + residual)?;
+            layer_in = x;
+            intermediates.push(layer_in.clone());
+        }
+        let x = self.norm.forward(&layer_in)?;
+        let x = x.i((.., seq_len - 1, ..))?;
+        let _enter = self.span_output.enter();
+        let logits = self.output.forward(&x)?;
+        Ok((logits, intermediates))
+    }
 }
 
 #[cfg(test)]
