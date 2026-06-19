@@ -664,9 +664,23 @@ impl ModelWeights {
         let key_length_swa = md_u32(&gg, &format!("{arch}.attention.key_length_swa"))? as usize;
         let sliding_window = md_u32(&gg, &format!("{arch}.attention.sliding_window"))? as usize;
         let context_length = md_u32(&gg, &format!("{arch}.context_length"))? as usize;
-        // MoE: expert intermediate size and active experts per token.
-        let moe_inter = md_u32(&gg, &format!("{arch}.expert_feed_forward_length"))? as usize;
-        let num_experts_per_tok = md_u32(&gg, &format!("{arch}.expert_used_count"))? as usize;
+        // MoE: expert intermediate size and active experts per token. Dense
+        // gemma4 GGUFs carry no experts (and omit this metadata), so read these
+        // only when experts are present; otherwise every layer's Gemma4Moe::load
+        // returns None and these values go unused.
+        let expert_count = gg
+            .metadata()
+            .get(&format!("{arch}.expert_count"))
+            .and_then(|v| v.to_u32().ok())
+            .unwrap_or(0) as usize;
+        let (moe_inter, num_experts_per_tok) = if expert_count > 0 {
+            (
+                md_u32(&gg, &format!("{arch}.expert_feed_forward_length"))? as usize,
+                md_u32(&gg, &format!("{arch}.expert_used_count"))? as usize,
+            )
+        } else {
+            (0, 0)
+        };
         let rms_norm_eps = match gg
             .metadata()
             .get(&format!("{arch}.attention.layer_norm_rms_epsilon"))
