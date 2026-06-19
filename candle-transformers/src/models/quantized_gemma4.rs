@@ -359,11 +359,21 @@ impl Gemma4Moe {
         dtype: DType,
         device: &Device,
     ) -> Result<Option<Self>> {
-        // Present only on MoE (enable_moe_block) layers.
+        // Present only on MoE (enable_moe_block) layers. Dense layers (and dense
+        // checkpoints) have no expert tensors, so they return here before the
+        // CUDA check below and run fine on any device.
         let gate_up = match gg.tensor(&format!("{prefix}.ffn_gate_up_exps.weight")) {
             Ok(t) => t,
             Err(_) => return Ok(None),
         };
+        // The expert GEMM (moe_gemm_gguf) is CUDA-only; fail fast with a clear
+        // message rather than deep inside the kernel on CPU/Metal.
+        if !device.is_cuda() {
+            candle::bail!(
+                "gemma4 MoE layers require a CUDA device (moe_gemm_gguf is CUDA-only); \
+                 load on CUDA, or use a dense gemma4 checkpoint"
+            );
+        }
         let router_proj_w = gg
             .tensor(&format!("{prefix}.ffn_gate_inp.weight"))?
             .dequantize(device)?
