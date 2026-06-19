@@ -498,4 +498,10 @@ impl GGUFQWenMoE {
             .squeeze(1)?;
         Ok((logits, intermediates))
     }
+
+    pub fn clear_kv_cache(&mut self) {
+        for layer in self.layers.iter_mut() {
+            layer.self_attn.kv_cache.reset();
+        }
+    }
 }
