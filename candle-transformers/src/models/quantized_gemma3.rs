@@ -529,4 +529,10 @@ impl ModelWeights {
         let output = self.output.forward(&x)?;
         Ok((output, intermediates))
     }
+
+    pub fn clear_kv_cache(&mut self) {
+        for layer in self.layers.iter_mut() {
+            layer.kv_cache = None;
+        }
+    }
 }
