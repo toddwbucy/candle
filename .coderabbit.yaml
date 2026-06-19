@@ -1,0 +1,21 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# CodeRabbit config for the toddwbucy/candle fork.
+# MUST live on the repo default branch (main): CodeRabbit reads .coderabbit.yaml
+# from the default branch, not the PR base. (It will not honor a copy placed on
+# integration or on a feature branch.)
+#
+# Consequence to manage: because it lives on main, it rides along on every
+# feat/* branch cut from main. Strip it from any upstream PR diff
+# (feat/* -> huggingface/candle), and preserve this commit across fork.sh
+# sync-main (it diverges main from upstream/main by this one commit).
+language: en-US
+reviews:
+  profile: assertive
+  review_status: false
+  auto_review:
+    enabled: true
+    # The default branch (main) is always auto-reviewed; add integration so the
+    # feat/* -> integration promotion PRs get reviewed too.
+    base_branches:
+      - integration
