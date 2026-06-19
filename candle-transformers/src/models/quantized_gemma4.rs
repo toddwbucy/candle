@@ -709,7 +709,14 @@ impl ModelWeights {
             .and_then(|v| v.to_vec().ok())
             .map(|vs| {
                 vs.iter()
-                    .filter_map(|x| x.to_u32().ok().map(|n| n as usize))
+                    // head_count_kv is stored as an i32 array (to_u32 alone
+                    // rejects it); accept either signedness.
+                    .filter_map(|x| {
+                        x.to_u32()
+                            .or_else(|_| x.to_i32().map(|n| n as u32))
+                            .ok()
+                            .map(|n| n as usize)
+                    })
                     .collect()
             })
             .unwrap_or_default();
