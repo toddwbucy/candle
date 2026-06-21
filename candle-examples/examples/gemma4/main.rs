@@ -91,9 +91,18 @@ impl TextGeneration {
         std::io::stdout().flush()?;
 
         let mut generated_tokens = 0usize;
-        let eos_token = match self.tokenizer.get_token("</s>") {
+        let eos_token = match self.tokenizer.get_token("<eos>") {
             Some(token) => token,
-            None => anyhow::bail!("cannot find the </s> token"),
+            None => anyhow::bail!("cannot find the <eos> token"),
+        };
+        // gemma4 ends a model turn with <turn|> (it has no <end_of_turn>); stop
+        // on it so chat generation does not run past the model's answer.
+        let eot_token = match self.tokenizer.get_token("<turn|>") {
+            Some(token) => token,
+            None => {
+                println!("Warning: <turn|> token not found in tokenizer, using <eos> as a backup");
+                eos_token
+            }
         };
         let start_gen = std::time::Instant::now();
         for index in 0..sample_len {
@@ -120,7 +129,7 @@ impl TextGeneration {
             let next_token = self.logits_processor.sample(&logits)?;
             tokens.push(next_token);
             generated_tokens += 1;
-            if next_token == eos_token {
+            if next_token == eos_token || next_token == eot_token {
                 break;
             }
             if let Some(t) = self.tokenizer.next_token(next_token)? {
@@ -320,6 +329,12 @@ fn main() -> Result<()> {
         args.repeat_last_n,
         &device,
     );
-    pipeline.run(&args.prompt, args.sample_len)?;
+    // Wrap the prompt in the gemma4 instruction template. gemma4's turn markers
+    // are <|turn>/<turn|> (it has no <start_of_turn>/<end_of_turn>), and the user
+    // content sits on its own line terminated by <turn|>, then the model turn is
+    // opened. Without this, an -it model is fed an unstructured prompt and the
+    // generation does not condition on it as a chat turn.
+    let prompt = format!("<|turn>user\n{}<turn|>\n<|turn>model\n", args.prompt);
+    pipeline.run(&prompt, args.sample_len)?;
     Ok(())
 }
