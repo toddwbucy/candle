@@ -185,6 +185,96 @@ fn flash_attn_acausal_softcap() -> Result<()> {
     Ok(())
 }
 
+fn expected_num_splits(device: &Device, b: usize, h: usize, sq: usize, sk: usize) -> Result<usize> {
+    let cuda_dev = device.as_cuda_device()?;
+    let num_sm = cuda_dev
+        .cuda_stream()
+        .context()
+        .attribute(
+            candle::cuda_backend::cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+        )
+        .map_err(|e| anyhow::anyhow!("cuDeviceGetAttribute(MULTIPROCESSOR_COUNT): {e}"))?
+        as usize;
+    let num_n_blocks = sk.div_ceil(candle_flash_attn::SPLITKV_BLOCK_N);
+    let num_m_blocks = sq.div_ceil(64);
+    Ok(candle_flash_attn::num_splits_heuristic(
+        b * h * num_m_blocks,
+        num_sm * 2,
+        num_n_blocks,
+        128,
+    ))
+}
+
+fn splitkv_against_reference(b: usize, h: usize, sq: usize, sk: usize, d: usize) -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    let scale = 1.0f32 / (d as f32).sqrt();
+
+    // Assert the dispatcher actually picks splitkv for this shape on this
+    // device, so the test fails instead of silently passing via the dense
+    // path if the heuristic regresses.
+    let num_splits = expected_num_splits(&device, b, h, sq, sk)?;
+    assert!(
+        num_splits > 1,
+        "expected splitkv path for (b={b}, h={h}, sq={sq}, sk={sk}, d={d}), heuristic chose num_splits={num_splits}",
+    );
+
+    // Flash-attn input layout is (batch, seq, heads, head_dim). Deterministic
+    // varied values built host-side; small prime moduli keep everything well
+    // inside f16 range at any tensor size while giving non-uniform scores.
+    let fill = |n: usize, m: u32| -> Vec<f32> {
+        (0..n as u32)
+            .map(|i| (i % m) as f32 / m as f32 - 0.5)
+            .collect()
+    };
+    let q =
+        Tensor::from_vec(fill(b * sq * h * d, 97), (b, sq, h, d), &device)?.to_dtype(DType::F16)?;
+    let k =
+        Tensor::from_vec(fill(b * sk * h * d, 89), (b, sk, h, d), &device)?.to_dtype(DType::F16)?;
+    let v =
+        Tensor::from_vec(fill(b * sk * h * d, 83), (b, sk, h, d), &device)?.to_dtype(DType::F16)?;
+
+    // Reference attention: collapse (batch, heads) into a single batch axis
+    // so fa_acausal's rank-3 matmul matches per-head, then unflatten.
+    let ys_ref = {
+        let qref = q.transpose(1, 2)?.contiguous()?.reshape((b * h, sq, d))?;
+        let kref = k.transpose(1, 2)?.contiguous()?.reshape((b * h, sk, d))?;
+        let vref = v.transpose(1, 2)?.contiguous()?.reshape((b * h, sk, d))?;
+        fa_acausal(&qref, &kref, &vref, scale)?
+            .reshape((b, h, sq, d))?
+            .transpose(1, 2)?
+            .contiguous()?
+    };
+
+    let ys = candle_flash_attn::flash_attn(&q, &k, &v, scale, false)?;
+
+    let ys = ys.to_dtype(DType::F32)?;
+    let ys_ref = ys_ref.to_dtype(DType::F32)?;
+    assert_eq!(ys.dims(), &[b, sq, h, d]);
+    let diff = ys.sub(&ys_ref)?.abs()?.flatten_all()?.max(0)?;
+    let diff_v = diff.to_vec0::<f32>()?;
+    assert!(
+        diff_v < 5e-3,
+        "splitkv vs fa_acausal max abs diff = {diff_v} (expected < 5e-3)"
+    );
+    Ok(())
+}
+
+#[test]
+fn flash_attn_acausal_splitkv() -> Result<()> {
+    // Small grid (batch * heads * m_blocks = 2) with 16 K-blocks: the
+    // heuristic returns >= 2 on any modern GPU, exercising the split
+    // kernels plus the fp32 combine kernel.
+    splitkv_against_reference(1, 2, 8, 512, 64)
+}
+
+#[test]
+fn flash_attn_decode_splitkv() -> Result<()> {
+    // Single-token decode over a long KV: seqlen_q = 1, seqlen_k = 4096,
+    // head_dim = 128. This is the long-context decode shape the splitkv
+    // dispatch exists for.
+    splitkv_against_reference(1, 8, 1, 4096, 128)
+}
+
 #[test]
 fn flash_attn_varlen_paged_mm_prefix_windowed() -> Result<()> {
     let device = Device::new_cuda(0)?;

@@ -58,6 +58,11 @@ extern "C" {
         mm_prefix_range_batch_stride: u32,
         max_mm_prefix_ranges: c_int,
         stream_ptr: *mut c_void,
+
+        num_splits: c_int,
+        softmax_lseaccum_ptr: *const c_void,
+        oaccum_ptr: *const c_void,
+        force_split_kernel: c_int,
     );
 
 }
