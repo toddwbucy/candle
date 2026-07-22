@@ -599,6 +599,32 @@ impl ModelWeights {
         self.output.forward(&self.norm.forward(&xs)?)
     }
 
+    /// Forward pass that also returns the residual stream at each decoder layer.
+    ///
+    /// The second element holds one tensor per layer, in layer order, each the
+    /// post-block hidden state shaped (batch, seq, hidden) before the final norm.
+    /// Both layer types (gated attention and Gated DeltaNet) contribute their
+    /// post-block output, so the captured stream is uniform across the hybrid
+    /// stack. This is opt-in: the regular forward path is unchanged and captures
+    /// nothing (the clone does not perturb the DeltaNet or attention state path).
+    pub fn forward_with_intermediates(
+        &mut self,
+        input: &Tensor,
+        offset: usize,
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        let (_b, seq_len) = input.dims2()?;
+        let mut xs = self.tok_embeddings.forward(input)?;
+        let mask = self.causal_mask(seq_len, offset)?;
+        let mut intermediates = Vec::with_capacity(self.layers.len());
+        for layer in self.layers.iter_mut() {
+            xs = layer.forward(&xs, mask.as_ref(), offset)?;
+            intermediates.push(xs.clone());
+        }
+        let last = xs.i((.., seq_len - 1, ..))?;
+        let logits = self.output.forward(&self.norm.forward(&last)?)?;
+        Ok((logits, intermediates))
+    }
+
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache();
