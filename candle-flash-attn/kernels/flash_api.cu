@@ -2,11 +2,13 @@
 #include "kernel_helpers.h"
 #include "flash_fwd_launch_template.h"
 
-void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
   FP16_SWITCH(!params.is_bf16, [&] {
       BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-          if (params.block_table != nullptr) {
-              // Only the splitkv kernel understands paged KV; head dims here match the host-side gate.
+          if (params.block_table != nullptr || params.num_splits > 1 || force_split_kernel) {
+              // The splitkv kernel handles both paged KV (block_table set) and dense KV
+              // split across the K dimension (num_splits > 1); head dims match the
+              // instantiated splitkv kernel set.
               if (params.d <= 64) {
                   run_mha_fwd_splitkv_paged_<elem_type, 64, Is_causal>(params, stream);
               } else if (params.d <= 128) {
@@ -81,7 +83,12 @@ extern "C" void run_mha(
     int32_t *mm_prefix_ranges_ptr,
     uint32_t mm_prefix_range_batch_stride,
     int max_mm_prefix_ranges,
-    void *stream_ptr
+    void *stream_ptr,
+
+    int num_splits,
+    void *softmax_lseaccum_ptr,
+    void *oaccum_ptr,
+    int force_split_kernel
 ) {
     Flash_fwd_params params;
     // Reset the parameters
@@ -158,9 +165,14 @@ extern "C" void run_mha(
     params.window_size_right = window_size_right;
 
     params.is_seqlens_k_cumulative = true;
-    params.num_splits = 1;
+    // The splitkv combine kernel statically requires 128 threads; head dims above 256
+    // may select the 2-warp launch config on low-smem devices, so clamp them to a
+    // single split (matches the kNThreads == 128 guard in run_flash_splitkv_fwd).
+    params.num_splits = (num_splits < 1 || d > 256) ? 1 : num_splits;
+    params.softmax_lseaccum_ptr = softmax_lseaccum_ptr;
+    params.oaccum_ptr = oaccum_ptr;
     params.unpadded_lse = unpadded_lse;
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    run_mha_fwd(params, stream);
+    run_mha_fwd(params, stream, force_split_kernel != 0);
 }

@@ -5,6 +5,136 @@ use candle::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
 use candle::{CpuStorage, DType, Layout, Result, Shape, Tensor};
 use half::{bf16, f16};
 
+/// K-dimension tile size of the splitkv kernels.
+///
+/// This MUST match the kBlockN baked into run_mha_fwd_splitkv_paged_dispatch
+/// in kernels/flash_fwd_launch_template.h. If that block size changes, this
+/// constant needs the same change or num_splits will be miscomputed.
+///
+/// Exposed for integration tests only; not part of the supported API.
+#[doc(hidden)]
+pub const SPLITKV_BLOCK_N: usize = 32;
+
+/// M-dimension tile size of the splitkv kernels; see SPLITKV_BLOCK_N.
+const SPLITKV_BLOCK_M: usize = 64;
+
+/// Port of num_splits_heuristic from Tri Dao's flash_api.cpp. Picks the
+/// smallest split count whose SM-occupancy efficiency reaches at least 85
+/// percent of the best achievable, capped at max_splits. Returns 1 (no
+/// split) when the grid already nearly fills the SMs.
+///
+/// Exposed so integration tests can verify the dispatcher actually enters
+/// the splitkv path for a given shape (catching silent fallback to the
+/// dense path if this heuristic regresses); not part of the supported API.
+#[doc(hidden)]
+pub fn num_splits_heuristic(
+    batch_nheads_mblocks: usize,
+    num_sms: usize,
+    num_n_blocks: usize,
+    max_splits: usize,
+) -> usize {
+    // If we already nearly fill the SMs, splitting adds overhead without
+    // helping. Integer form of upstream's ">= 0.8 * num_SMs" check.
+    if batch_nheads_mblocks.saturating_mul(5) >= num_sms.saturating_mul(4) {
+        return 1;
+    }
+    let max_splits = max_splits.min(num_sms).min(num_n_blocks);
+    if max_splits == 0 {
+        return 1;
+    }
+    let ceildiv = |a: usize, b: usize| a.div_ceil(b);
+    // Skip split counts that produce the same per-split block layout as a
+    // smaller count (e.g. 12 splits across 64 blocks collapses to 11).
+    let is_eligible =
+        |n: usize| -> bool { n == 1 || ceildiv(num_n_blocks, n) != ceildiv(num_n_blocks, n - 1) };
+    let mut max_eff = 0.0f32;
+    let mut effs = Vec::with_capacity(max_splits);
+    for n in 1..=max_splits {
+        if !is_eligible(n) {
+            effs.push(0.0);
+            continue;
+        }
+        let n_waves = (batch_nheads_mblocks * n) as f32 / num_sms as f32;
+        let eff = n_waves / n_waves.ceil();
+        if eff > max_eff {
+            max_eff = eff;
+        }
+        effs.push(eff);
+    }
+    for n in 1..=max_splits {
+        if is_eligible(n) && effs[n - 1] >= 0.85 * max_eff {
+            return n;
+        }
+    }
+    1
+}
+
+/// Rust port of set_params_splitkv from Tri Dao's flash_api.cpp: decides
+/// whether the non-paged forward should split the K dimension across SMs
+/// and, if so, allocates the two fp32 accumulator buffers the splitkv
+/// combine kernel reads.
+///
+/// Returns (num_splits, accumulators). When num_splits == 1 the dense path
+/// is taken and accumulators is None. The returned CudaSlices must outlive
+/// the ffi::run_mha call (their device_ptr guards are taken at the call
+/// site).
+///
+/// Accumulator layouts match flash_fwd_splitkv_combine_kernel:
+///   softmax_lse_accum: (num_splits, batch_size, num_heads, seqlen_q)
+///   out_accum: (num_splits, batch_size, num_heads, seqlen_q, head_size_rounded)
+/// (softmax_lse_accum, out_accum) buffers for the splitkv combine kernel.
+type SplitKvAccum = (
+    candle::cuda_backend::cudarc::driver::CudaSlice<f32>,
+    candle::cuda_backend::cudarc::driver::CudaSlice<f32>,
+);
+
+fn set_params_splitkv(
+    dev: &candle::CudaDevice,
+    batch_size: usize,
+    num_heads: usize,
+    head_size: usize,
+    head_size_rounded: usize,
+    seqlen_q: usize,
+    seqlen_k: usize,
+) -> Result<(i32, Option<SplitKvAccum>)> {
+    // The splitkv combine kernel statically requires 128 threads. Head dims
+    // above 256 can select the 2-warp launch config on low-smem devices
+    // (see run_mha_fwd_splitkv_paged_hdim512), so never split them.
+    if head_size > 256 {
+        return Ok((1, None));
+    }
+    let num_n_blocks = seqlen_k.div_ceil(SPLITKV_BLOCK_N);
+    let num_m_blocks = seqlen_q.div_ceil(SPLITKV_BLOCK_M);
+
+    // Upstream doubles num_SMs because the 128-thread splitkv kernel lets
+    // each SM host two CTAs.
+    let num_sm = dev
+        .cuda_stream()
+        .context()
+        .attribute(
+            candle::cuda_backend::cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+        )
+        .map_err(|e| {
+            candle::Error::Msg(format!("cuDeviceGetAttribute(MULTIPROCESSOR_COUNT): {e}"))
+        })? as usize;
+
+    let num_splits = num_splits_heuristic(
+        batch_size * num_heads * num_m_blocks,
+        num_sm * 2,
+        num_n_blocks,
+        128,
+    );
+    if num_splits <= 1 {
+        return Ok((1, None));
+    }
+
+    let lse_n = num_splits * batch_size * num_heads * seqlen_q;
+    let out_n = lse_n * head_size_rounded;
+    let lse_accum = unsafe { dev.alloc::<f32>(lse_n)? };
+    let out_accum = unsafe { dev.alloc::<f32>(out_n)? };
+    Ok((num_splits as i32, Some((lse_accum, out_accum))))
+}
+
 pub struct FlashAttn {
     pub softmax_scale: f32,
     pub alibi_slopes: Option<Tensor>,
@@ -144,6 +274,21 @@ impl FlashAttn {
         let mut dst = unsafe { dev.alloc::<T>(elem_count)? };
         let mut softmax_lse = dev.alloc_zeros::<f32>(b_sz * num_heads * seqlen_q)?;
 
+        // Decide between the dense kernel (num_splits == 1) and splitting the
+        // K dimension across SMs (num_splits > 1), allocating the fp32
+        // accumulators the combine kernel needs when splitting. Long-context
+        // decode shapes (small batch * heads * m_blocks vs the SM count) are
+        // where this engages; large grids keep the dense path.
+        let (num_splits, mut splitkv_buffers) = set_params_splitkv(
+            dev,
+            b_sz,
+            num_heads,
+            head_size,
+            head_size_rounded,
+            seqlen_q,
+            seqlen_k,
+        )?;
+
         let is_bf16 = if is_bf16 { 1 } else { 0 };
 
         // Causal is the special case where window_size_right == 0 and window_size_left < 0.
@@ -166,6 +311,28 @@ impl FlashAttn {
             let (v_ptr, _guard) = v.device_ptr(&stream);
             let (dst_ptr, _guard) = dst.device_ptr_mut(&stream);
             let (softmax_lse_ptr, _guard) = softmax_lse.device_ptr_mut(&stream);
+            // Splitkv accumulator pointers and their guards; bound here so
+            // the guards live for the FFI call. Null when num_splits == 1.
+            let lseaccum_ptr;
+            let oaccum_ptr;
+            let _splitkv_lse_guard;
+            let _splitkv_out_guard;
+            match &mut splitkv_buffers {
+                Some((lse_acc, out_acc)) => {
+                    let (l, lg) = lse_acc.device_ptr_mut(&stream);
+                    let (o, og) = out_acc.device_ptr_mut(&stream);
+                    lseaccum_ptr = l as *const core::ffi::c_void;
+                    oaccum_ptr = o as *const core::ffi::c_void;
+                    _splitkv_lse_guard = Some(lg);
+                    _splitkv_out_guard = Some(og);
+                }
+                None => {
+                    lseaccum_ptr = std::ptr::null();
+                    oaccum_ptr = std::ptr::null();
+                    _splitkv_lse_guard = None;
+                    _splitkv_out_guard = None;
+                }
+            }
             ffi::run_mha(
                 q_ptr as *const core::ffi::c_void,
                 k_ptr as *const core::ffi::c_void,
@@ -212,6 +379,10 @@ impl FlashAttn {
                 /* mm_prefix_range_batch_stride */ 0,
                 /* max_mm_prefix_ranges */ 0,
                 /* stream_ptr */ stream.cu_stream() as *mut core::ffi::c_void,
+                /* num_splits */ num_splits,
+                /* softmax_lseaccum_ptr */ lseaccum_ptr,
+                /* oaccum_ptr */ oaccum_ptr,
+                /* force_split_kernel */ 0,
             )
         }
 
@@ -813,6 +984,15 @@ impl FlashAttnVarLen {
                 /* mm_prefix_range_batch_stride */ mm_prefix_range_batch_stride,
                 /* max_mm_prefix_ranges */ max_mm_prefix_ranges,
                 /* stream_ptr */ stream.cu_stream() as *mut core::ffi::c_void,
+                // The varlen path never splits the K dimension: splitting
+                // interacts with the unpadded LSE accumulator layout and is
+                // not exercised upstream, and paged callers already reach the
+                // splitkv kernel via block_table with num_splits == 1.
+                /* num_splits */
+                1,
+                /* softmax_lseaccum_ptr */ std::ptr::null(),
+                /* oaccum_ptr */ std::ptr::null(),
+                /* force_split_kernel */ 0,
             )
         }
 
