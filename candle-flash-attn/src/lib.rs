@@ -69,6 +69,47 @@ pub fn num_splits_heuristic(
     1
 }
 
+/// (softmax_lse_accum, out_accum) buffers for the splitkv combine kernel.
+type SplitKvAccum = (
+    candle::cuda_backend::cudarc::driver::CudaSlice<f32>,
+    candle::cuda_backend::cudarc::driver::CudaSlice<f32>,
+);
+
+/// Head-dim bucket the splitkv kernels are dispatched at, mirroring the gate
+/// in kernels/flash_api.cu (run_mha_fwd). The paged/dense splitkv kernels are
+/// instantiated only at 64/128/256/512.
+///
+/// Exposed for integration tests; not part of the supported API.
+#[doc(hidden)]
+pub fn splitkv_dispatch_bucket(head_size: usize) -> usize {
+    if head_size <= 64 {
+        64
+    } else if head_size <= 128 {
+        128
+    } else if head_size <= 256 {
+        256
+    } else {
+        512
+    }
+}
+
+/// Whether the dense forward may split the K dimension for this head size.
+///
+/// Two constraints, both of which produce silent corruption if ignored:
+/// - The split write path strides output rows by the compile-time dispatch
+///   bucket, while the accumulator layout strides by head_size_rounded. When
+///   they differ (head dims like 96/160/192/224) rows past the first in a tile
+///   are written out of bounds. See toddwbucy/candle#28.
+/// - Head dims above 256 can select the 2-warp splitkv config on low-smem
+///   devices, but the combine kernel statically requires 128 threads
+///   (see run_mha_fwd_splitkv_paged_hdim512), so those never split.
+///
+/// Exposed for integration tests; not part of the supported API.
+#[doc(hidden)]
+pub fn splitkv_allowed(head_size: usize, head_size_rounded: usize) -> bool {
+    head_size <= 256 && splitkv_dispatch_bucket(head_size) == head_size_rounded
+}
+
 /// Rust port of set_params_splitkv from Tri Dao's flash_api.cpp: decides
 /// whether the non-paged forward should split the K dimension across SMs
 /// and, if so, allocates the two fp32 accumulator buffers the splitkv
@@ -82,12 +123,6 @@ pub fn num_splits_heuristic(
 /// Accumulator layouts match flash_fwd_splitkv_combine_kernel:
 ///   softmax_lse_accum: (num_splits, batch_size, num_heads, seqlen_q)
 ///   out_accum: (num_splits, batch_size, num_heads, seqlen_q, head_size_rounded)
-/// (softmax_lse_accum, out_accum) buffers for the splitkv combine kernel.
-type SplitKvAccum = (
-    candle::cuda_backend::cudarc::driver::CudaSlice<f32>,
-    candle::cuda_backend::cudarc::driver::CudaSlice<f32>,
-);
-
 fn set_params_splitkv(
     dev: &candle::CudaDevice,
     batch_size: usize,
@@ -97,10 +132,7 @@ fn set_params_splitkv(
     seqlen_q: usize,
     seqlen_k: usize,
 ) -> Result<(i32, Option<SplitKvAccum>)> {
-    // The splitkv combine kernel statically requires 128 threads. Head dims
-    // above 256 can select the 2-warp launch config on low-smem devices
-    // (see run_mha_fwd_splitkv_paged_hdim512), so never split them.
-    if head_size > 256 {
+    if !splitkv_allowed(head_size, head_size_rounded) {
         return Ok((1, None));
     }
     let num_n_blocks = seqlen_k.div_ceil(SPLITKV_BLOCK_N);

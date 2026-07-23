@@ -205,18 +205,15 @@ fn expected_num_splits(device: &Device, b: usize, h: usize, sq: usize, sk: usize
     ))
 }
 
-fn splitkv_against_reference(b: usize, h: usize, sq: usize, sk: usize, d: usize) -> Result<()> {
-    let device = Device::new_cuda(0)?;
+fn run_against_reference(
+    device: &Device,
+    b: usize,
+    h: usize,
+    sq: usize,
+    sk: usize,
+    d: usize,
+) -> Result<()> {
     let scale = 1.0f32 / (d as f32).sqrt();
-
-    // Assert the dispatcher actually picks splitkv for this shape on this
-    // device, so the test fails instead of silently passing via the dense
-    // path if the heuristic regresses.
-    let num_splits = expected_num_splits(&device, b, h, sq, sk)?;
-    assert!(
-        num_splits > 1,
-        "expected splitkv path for (b={b}, h={h}, sq={sq}, sk={sk}, d={d}), heuristic chose num_splits={num_splits}",
-    );
 
     // Flash-attn input layout is (batch, seq, heads, head_dim). Deterministic
     // varied values built host-side; small prime moduli keep everything well
@@ -227,11 +224,11 @@ fn splitkv_against_reference(b: usize, h: usize, sq: usize, sk: usize, d: usize)
             .collect()
     };
     let q =
-        Tensor::from_vec(fill(b * sq * h * d, 97), (b, sq, h, d), &device)?.to_dtype(DType::F16)?;
+        Tensor::from_vec(fill(b * sq * h * d, 97), (b, sq, h, d), device)?.to_dtype(DType::F16)?;
     let k =
-        Tensor::from_vec(fill(b * sk * h * d, 89), (b, sk, h, d), &device)?.to_dtype(DType::F16)?;
+        Tensor::from_vec(fill(b * sk * h * d, 89), (b, sk, h, d), device)?.to_dtype(DType::F16)?;
     let v =
-        Tensor::from_vec(fill(b * sk * h * d, 83), (b, sk, h, d), &device)?.to_dtype(DType::F16)?;
+        Tensor::from_vec(fill(b * sk * h * d, 83), (b, sk, h, d), device)?.to_dtype(DType::F16)?;
 
     // Reference attention: collapse (batch, heads) into a single batch axis
     // so fa_acausal's rank-3 matmul matches per-head, then unflatten.
@@ -257,6 +254,81 @@ fn splitkv_against_reference(b: usize, h: usize, sq: usize, sk: usize, d: usize)
         "splitkv vs fa_acausal max abs diff = {diff_v} (expected < 5e-3)"
     );
     Ok(())
+}
+
+fn splitkv_against_reference(b: usize, h: usize, sq: usize, sk: usize, d: usize) -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    // Assert the dispatcher actually picks splitkv for this shape on this
+    // device, so the test fails instead of silently passing via the dense
+    // path if the heuristic regresses.
+    let num_splits = expected_num_splits(&device, b, h, sq, sk)?;
+    assert!(
+        num_splits > 1,
+        "expected splitkv path for (b={b}, h={h}, sq={sq}, sk={sk}, d={d}), heuristic chose num_splits={num_splits}",
+    );
+    run_against_reference(&device, b, h, sq, sk, d)
+}
+
+// Round to a multiple of 32, matching round_multiple(head_size, 32) in the crate.
+fn head_size_rounded(head_size: usize) -> usize {
+    head_size.div_ceil(32) * 32
+}
+
+#[test]
+fn splitkv_allowed_only_for_bucket_aligned_head_dims() {
+    // Regression for toddwbucy/candle#28. The splitkv kernel strides output
+    // rows by the compile-time dispatch bucket (64/128/256/512) while the
+    // accumulator layout strides by head_size_rounded; they agree only for
+    // head dims 64/128/256, so only those may split. Any other dim <= 256, or
+    // any dim > 256, must be refused or the kernel writes out of bounds.
+    // Deterministic (no GPU): fails if the guard in set_params_splitkv weakens.
+    // Allowed: head_size_rounded already equals the dispatch bucket (the dim
+    // rounds up to 64/128/256), so the kernel's kHeadDim stride matches the
+    // accumulator layout. Includes non-power-of-two dims like 40/104/232.
+    for hs in [40usize, 64, 104, 128, 232, 256] {
+        assert!(
+            candle_flash_attn::splitkv_allowed(hs, head_size_rounded(hs)),
+            "head_size {hs} rounds to its dispatch bucket and must be allowed to split",
+        );
+    }
+    // Refused: bucket overshoots head_size_rounded, so the kernel strides rows
+    // wider than the allocation and writes out of bounds (#28).
+    for hs in [32usize, 72, 80, 96, 160, 192, 224] {
+        assert!(
+            !candle_flash_attn::splitkv_allowed(hs, head_size_rounded(hs)),
+            "head_size {hs} is bucket-mismatched (OOB, #28) and must be refused",
+        );
+    }
+    for hs in [264usize, 288, 512] {
+        assert!(
+            !candle_flash_attn::splitkv_allowed(hs, head_size_rounded(hs)),
+            "head_size {hs} > 256 must be refused (2-warp combine config)",
+        );
+    }
+}
+
+#[test]
+fn flash_attn_splitkv_headdim96_guard() -> Result<()> {
+    // Regression for toddwbucy/candle#28. head_dim 96 dispatches to the
+    // kHeadDim=128 splitkv kernel, but the accumulator layout strides rows by
+    // head_size_rounded=96, so splitting writes out of bounds for any tile with
+    // more than one query row (confirmed via compute-sanitizer memcheck). This
+    // shape (seqlen_q>1, small grid, long KV) tempts the raw heuristic to split;
+    // the guard must suppress it. Output correctness alone does not catch the
+    // OOB (it lands in adjacent scratch), so this pairs with the deterministic
+    // splitkv_allowed test above and a sanitizer run.
+    assert!(!candle_flash_attn::splitkv_allowed(
+        96,
+        head_size_rounded(96)
+    ));
+    let device = Device::new_cuda(0)?;
+    let (b, h, sq, sk, d) = (1usize, 2, 64, 4096, 96);
+    let raw = expected_num_splits(&device, b, h, sq, sk)?;
+    assert!(
+        raw > 1,
+        "shape should tempt the heuristic to split (raw num_splits={raw}); test is not exercising the guard",
+    );
+    run_against_reference(&device, b, h, sq, sk, d)
 }
 
 #[test]
