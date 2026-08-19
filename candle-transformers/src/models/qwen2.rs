@@ -325,7 +325,12 @@ impl Model {
                 })
             })
             .collect();
-        let mask = Tensor::from_slice(&mask, (tgt_len, tgt_len), &self.device)?;
+        // The delta mask is built in f32 and the offset block in the model's
+        // dtype, so the cat at a nonzero offset concatenated two dtypes -
+        // every multi-token delta after a resident prefix. Cast before the
+        // cat so both halves agree.
+        let mask = Tensor::from_slice(&mask, (tgt_len, tgt_len), &self.device)?
+            .to_dtype(self.dtype)?;
         let mask = if seqlen_offset > 0 {
             let mask0 = Tensor::zeros((tgt_len, seqlen_offset), self.dtype, &self.device)?;
             Tensor::cat(&[&mask0, &mask], D::Minus1)?
@@ -382,6 +387,31 @@ impl Model {
         xs.apply(&self.norm)
     }
 
+    /// Forward pass that also returns the residual stream at each decoder layer.
+    ///
+    /// The second element holds one tensor per layer, in layer order, each the
+    /// post-block hidden state shaped (batch, seq, hidden) before the final norm.
+    /// This is opt-in: the regular forward path is unchanged and captures nothing.
+    pub fn forward_with_intermediates(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        let (b_size, seq_len) = input_ids.dims2()?;
+        let attention_mask = if seq_len <= 1 {
+            None
+        } else {
+            Some(self.prepare_causal_attention_mask(b_size, seq_len, seqlen_offset)?)
+        };
+        let mut xs = self.embed_tokens.forward(input_ids)?;
+        let mut intermediates = Vec::with_capacity(self.layers.len());
+        for layer in self.layers.iter_mut() {
+            xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset)?;
+            intermediates.push(xs.clone());
+        }
+        Ok((xs.apply(&self.norm)?, intermediates))
+    }
+
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
@@ -415,6 +445,21 @@ impl ModelForCausalLM {
             .forward(input_ids, seqlen_offset, None)?
             .narrow(1, seq_len - 1, 1)?
             .apply(&self.lm_head)
+    }
+
+    /// Forward pass that also returns the residual stream at each decoder layer,
+    /// mirroring the mistral pattern: opt-in, the regular path unchanged.
+    pub fn forward_with_intermediates(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        let (_b_size, seq_len) = input_ids.dims2()?;
+        let (hidden, intermediates) = self
+            .base_model
+            .forward_with_intermediates(input_ids, seqlen_offset)?;
+        let logits = hidden.narrow(1, seq_len - 1, 1)?.apply(&self.lm_head)?;
+        Ok((logits, intermediates))
     }
 
     pub fn clear_kv_cache(&mut self) {
