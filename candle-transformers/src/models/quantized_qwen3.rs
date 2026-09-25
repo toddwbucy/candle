@@ -310,7 +310,6 @@ impl AttentionWeights {
                     scale,
                 )?;
 
-                let ctx = ctx.unsqueeze(0)?.transpose(1, 2)?;
                 ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
             } else {
                 // Prefill: interleaved cache + flash_attn; also populate raw cache for decode.
@@ -580,6 +579,36 @@ impl ModelWeights {
         let _enter = self.span_output.enter();
         let last_hidden = h.narrow(1, l - 1, 1)?;
         self.lm_head.forward(&last_hidden)?.squeeze(1)
+    }
+
+    /// Forward pass that also returns the residual stream at each decoder layer.
+    ///
+    /// The second element holds one tensor per layer, in layer order, each the
+    /// post-block hidden state shaped (batch, seq, hidden) before the final norm.
+    /// Opt-in: the regular forward path is unchanged and captures nothing; the
+    /// clone does not perturb the attention KV-cache path.
+    pub fn forward_with_intermediates(
+        &mut self,
+        input: &Tensor,
+        offset: usize,
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        let _enter = self.span.enter();
+        let (b, l) = input.dims2()?;
+        let mut h = self.embed_tokens.forward(input)?;
+        let causal_mask = if l == 1 || self.device.is_cpu() {
+            None
+        } else {
+            Some(self.causal_mask(b, l, offset, None)?)
+        };
+        let mut intermediates = Vec::with_capacity(self.layers.len());
+        for layer in &mut self.layers {
+            h = layer.forward(&h, causal_mask.as_ref(), offset)?;
+            intermediates.push(h.clone());
+        }
+        let h = self.norm.forward(&h)?;
+        let last_hidden = h.narrow(1, l - 1, 1)?;
+        let logits = self.lm_head.forward(&last_hidden)?.squeeze(1)?;
+        Ok((logits, intermediates))
     }
 
     pub fn clear_kv_cache(&mut self) {

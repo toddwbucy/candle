@@ -329,6 +329,37 @@ impl Model {
             .apply(&self.lm_head)
     }
 
+    /// Forward pass that also returns the residual stream at each decoder layer.
+    ///
+    /// The second element holds one tensor per layer, in layer order, each the
+    /// post-block hidden state shaped (batch, seq, hidden) before the final norm.
+    /// This is opt-in: the regular forward path is unchanged and captures nothing.
+    pub fn forward_with_intermediates(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        let (_b_size, seq_len) = input_ids.dims2()?;
+        let attention_mask = if seq_len <= 1 {
+            None
+        } else {
+            let mask = self.prepare_decoder_attention_mask(seq_len, seqlen_offset)?;
+            Some(mask)
+        };
+        let mut xs = self.embed_tokens.forward(input_ids)?;
+        let mut intermediates = Vec::with_capacity(self.layers.len());
+        for layer in self.layers.iter_mut() {
+            xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset)?;
+            intermediates.push(xs.clone());
+        }
+        let logits = xs
+            .narrow(1, seq_len - 1, 1)?
+            .contiguous()?
+            .apply(&self.norm)?
+            .apply(&self.lm_head)?;
+        Ok((logits, intermediates))
+    }
+
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()

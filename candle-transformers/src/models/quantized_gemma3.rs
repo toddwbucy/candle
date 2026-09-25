@@ -477,4 +477,62 @@ impl ModelWeights {
 
         Ok(output)
     }
+
+    /// Forward pass that also returns the residual stream at each decoder layer.
+    ///
+    /// The second element holds one tensor per layer, in layer order, each the
+    /// post-block hidden state shaped (batch, seq, hidden) before the final norm.
+    /// Opt-in: the regular forward path is unchanged and captures nothing; the
+    /// clone does not perturb the attention KV-cache path.
+    pub fn forward_with_intermediates(
+        &mut self,
+        x: &Tensor,
+        index_pos: usize,
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        let (b_sz, seq_len) = x.dims2()?;
+        let _enter = self.span.enter();
+
+        let mut layer_in = self.tok_embeddings.forward(x)?;
+        layer_in = (layer_in * (self.embedding_length as f64).sqrt())?;
+
+        let mut intermediates = Vec::with_capacity(self.layers.len());
+        for layer in self.layers.iter_mut() {
+            let attention_mask = if seq_len == 1 {
+                None
+            } else {
+                Some(layer.mask(b_sz, seq_len, index_pos, x.dtype(), x.device())?)
+            };
+
+            // Attention block
+            let residual = &layer_in;
+            let x = layer.attention_norm.forward(&layer_in)?;
+            let x = layer.forward_attn(&x, attention_mask.as_ref(), index_pos)?;
+            let x = layer.post_attention_norm.forward(&x)?;
+            let x = (x + residual)?;
+
+            // Feed-forward block
+            let _enter = layer.span_mlp.enter();
+            let residual = &x;
+            let x = layer.ffn_norm.forward(&x)?;
+            let x = layer.mlp.forward(&x)?;
+            let x = layer.post_ffn_norm.forward(&x)?;
+            let x = (x + residual)?;
+            drop(_enter);
+
+            layer_in = x;
+            intermediates.push(layer_in.clone());
+        }
+
+        let _enter = self.span_output.enter();
+        let x = layer_in.i((.., seq_len - 1, ..))?;
+        let x = self.norm.forward(&x)?;
+        let output = self.output.forward(&x)?;
+        Ok((output, intermediates))
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        for layer in self.layers.iter_mut() {
+            layer.kv_cache = None;
+        }
+    }
 }

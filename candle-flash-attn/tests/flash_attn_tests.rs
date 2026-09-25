@@ -41,6 +41,50 @@ fn fa_acausal_softcap(q: &Tensor, k: &Tensor, v: &Tensor, softcap: f32) -> Resul
     Ok(output)
 }
 
+fn fa_windowed_mm_prefix(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    softmax_scale: f32,
+    window: usize,
+    ranges: &[(usize, usize)],
+) -> Result<Tensor> {
+    let in_dtype = q.dtype();
+    let q = q.to_dtype(DType::F32)?;
+    let k = k.to_dtype(DType::F32)?;
+    let v = v.to_dtype(DType::F32)?;
+    let (seq_len, n_heads, _) = q.dims3()?;
+    let (_, n_kv_heads, _) = k.dims3()?;
+    let groups = n_heads / n_kv_heads;
+    let mut heads = Vec::with_capacity(n_heads);
+    for head in 0..n_heads {
+        let kv_head = head / groups;
+        let q_h = q.i((.., head, ..))?.contiguous()?;
+        let k_h = k.i((.., kv_head, ..))?.contiguous()?;
+        let v_h = v.i((.., kv_head, ..))?.contiguous()?;
+        let mut mask = Vec::with_capacity(seq_len * seq_len);
+        for q_idx in 0..seq_len {
+            for k_idx in 0..seq_len {
+                let mm_prefix = ranges.iter().any(|&(start, end)| {
+                    q_idx >= start && q_idx < end && k_idx >= start && k_idx < end
+                });
+                let future = k_idx > q_idx;
+                let too_old = q_idx >= window && k_idx <= q_idx - window;
+                mask.push(if (future || too_old) && !mm_prefix {
+                    f32::NEG_INFINITY
+                } else {
+                    0.0
+                });
+            }
+        }
+        let mask = Tensor::from_vec(mask, (seq_len, seq_len), q.device())?;
+        let att = ((q_h.matmul(&k_h.t()?)? * softmax_scale as f64)? + mask)?;
+        let att = candle_nn::ops::softmax(&att, D::Minus1)?;
+        heads.push(att.matmul(&v_h.contiguous()?)?);
+    }
+    Ok(Tensor::stack(&heads, 1)?.to_dtype(in_dtype)?)
+}
+
 #[test]
 fn flash_attn_acausal() -> Result<()> {
     let device = Device::new_cuda(0)?;
@@ -138,6 +182,344 @@ fn flash_attn_acausal_softcap() -> Result<()> {
     assert_eq!(ys1.dims(), &[3, 5, 8]);
     assert_eq!(ys2.dims(), &[3, 5, 8]);
     assert!(diff.to_vec0::<f32>()?.abs() < 1e-3);
+    Ok(())
+}
+
+fn expected_num_splits(device: &Device, b: usize, h: usize, sq: usize, sk: usize) -> Result<usize> {
+    let cuda_dev = device.as_cuda_device()?;
+    let num_sm = cuda_dev
+        .cuda_stream()
+        .context()
+        .attribute(
+            candle::cuda_backend::cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+        )
+        .map_err(|e| anyhow::anyhow!("cuDeviceGetAttribute(MULTIPROCESSOR_COUNT): {e}"))?
+        as usize;
+    let num_n_blocks = sk.div_ceil(candle_flash_attn::SPLITKV_BLOCK_N);
+    let num_m_blocks = sq.div_ceil(64);
+    Ok(candle_flash_attn::num_splits_heuristic(
+        b * h * num_m_blocks,
+        num_sm * 2,
+        num_n_blocks,
+        128,
+    ))
+}
+
+fn run_against_reference(
+    device: &Device,
+    b: usize,
+    h: usize,
+    sq: usize,
+    sk: usize,
+    d: usize,
+) -> Result<()> {
+    let scale = 1.0f32 / (d as f32).sqrt();
+
+    // Flash-attn input layout is (batch, seq, heads, head_dim). Deterministic
+    // varied values built host-side; small prime moduli keep everything well
+    // inside f16 range at any tensor size while giving non-uniform scores.
+    let fill = |n: usize, m: u32| -> Vec<f32> {
+        (0..n as u32)
+            .map(|i| (i % m) as f32 / m as f32 - 0.5)
+            .collect()
+    };
+    let q =
+        Tensor::from_vec(fill(b * sq * h * d, 97), (b, sq, h, d), device)?.to_dtype(DType::F16)?;
+    let k =
+        Tensor::from_vec(fill(b * sk * h * d, 89), (b, sk, h, d), device)?.to_dtype(DType::F16)?;
+    let v =
+        Tensor::from_vec(fill(b * sk * h * d, 83), (b, sk, h, d), device)?.to_dtype(DType::F16)?;
+
+    // Reference attention: collapse (batch, heads) into a single batch axis
+    // so fa_acausal's rank-3 matmul matches per-head, then unflatten.
+    let ys_ref = {
+        let qref = q.transpose(1, 2)?.contiguous()?.reshape((b * h, sq, d))?;
+        let kref = k.transpose(1, 2)?.contiguous()?.reshape((b * h, sk, d))?;
+        let vref = v.transpose(1, 2)?.contiguous()?.reshape((b * h, sk, d))?;
+        fa_acausal(&qref, &kref, &vref, scale)?
+            .reshape((b, h, sq, d))?
+            .transpose(1, 2)?
+            .contiguous()?
+    };
+
+    let ys = candle_flash_attn::flash_attn(&q, &k, &v, scale, false)?;
+
+    let ys = ys.to_dtype(DType::F32)?;
+    let ys_ref = ys_ref.to_dtype(DType::F32)?;
+    assert_eq!(ys.dims(), &[b, sq, h, d]);
+    let diff = ys.sub(&ys_ref)?.abs()?.flatten_all()?.max(0)?;
+    let diff_v = diff.to_vec0::<f32>()?;
+    assert!(
+        diff_v < 5e-3,
+        "splitkv vs fa_acausal max abs diff = {diff_v} (expected < 5e-3)"
+    );
+    Ok(())
+}
+
+fn splitkv_against_reference(b: usize, h: usize, sq: usize, sk: usize, d: usize) -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    // Assert the dispatcher actually picks splitkv for this shape on this
+    // device, so the test fails instead of silently passing via the dense
+    // path if the heuristic regresses.
+    let num_splits = expected_num_splits(&device, b, h, sq, sk)?;
+    assert!(
+        num_splits > 1,
+        "expected splitkv path for (b={b}, h={h}, sq={sq}, sk={sk}, d={d}), heuristic chose num_splits={num_splits}",
+    );
+    run_against_reference(&device, b, h, sq, sk, d)
+}
+
+// Round to a multiple of 32, matching round_multiple(head_size, 32) in the crate.
+fn head_size_rounded(head_size: usize) -> usize {
+    head_size.div_ceil(32) * 32
+}
+
+#[test]
+fn splitkv_allowed_only_for_bucket_aligned_head_dims() {
+    // Regression for toddwbucy/candle#28. The splitkv kernel strides output
+    // rows by the compile-time dispatch bucket (64/128/256/512) while the
+    // accumulator layout strides by head_size_rounded; they agree only for
+    // head dims 64/128/256, so only those may split. Any other dim <= 256, or
+    // any dim > 256, must be refused or the kernel writes out of bounds.
+    // Deterministic (no GPU): fails if the guard in set_params_splitkv weakens.
+    // Allowed: head_size_rounded already equals the dispatch bucket (the dim
+    // rounds up to 64/128/256), so the kernel's kHeadDim stride matches the
+    // accumulator layout. Includes non-power-of-two dims like 40/104/232.
+    for hs in [40usize, 64, 104, 128, 232, 256] {
+        assert!(
+            candle_flash_attn::splitkv_allowed(hs, head_size_rounded(hs)),
+            "head_size {hs} rounds to its dispatch bucket and must be allowed to split",
+        );
+    }
+    // Refused: bucket overshoots head_size_rounded, so the kernel strides rows
+    // wider than the allocation and writes out of bounds (#28).
+    for hs in [32usize, 72, 80, 96, 160, 192, 224] {
+        assert!(
+            !candle_flash_attn::splitkv_allowed(hs, head_size_rounded(hs)),
+            "head_size {hs} is bucket-mismatched (OOB, #28) and must be refused",
+        );
+    }
+    for hs in [264usize, 288, 512] {
+        assert!(
+            !candle_flash_attn::splitkv_allowed(hs, head_size_rounded(hs)),
+            "head_size {hs} > 256 must be refused (2-warp combine config)",
+        );
+    }
+}
+
+#[test]
+fn flash_attn_splitkv_headdim96_guard() -> Result<()> {
+    // Regression for toddwbucy/candle#28. head_dim 96 dispatches to the
+    // kHeadDim=128 splitkv kernel, but the accumulator layout strides rows by
+    // head_size_rounded=96, so splitting writes out of bounds for any tile with
+    // more than one query row (confirmed via compute-sanitizer memcheck). This
+    // shape (seqlen_q>1, small grid, long KV) tempts the raw heuristic to split;
+    // the guard must suppress it. Output correctness alone does not catch the
+    // OOB (it lands in adjacent scratch), so this pairs with the deterministic
+    // splitkv_allowed test above and a sanitizer run.
+    assert!(!candle_flash_attn::splitkv_allowed(
+        96,
+        head_size_rounded(96)
+    ));
+    let device = Device::new_cuda(0)?;
+    let (b, h, sq, sk, d) = (1usize, 2, 64, 4096, 96);
+    let raw = expected_num_splits(&device, b, h, sq, sk)?;
+    assert!(
+        raw > 1,
+        "shape should tempt the heuristic to split (raw num_splits={raw}); test is not exercising the guard",
+    );
+    run_against_reference(&device, b, h, sq, sk, d)
+}
+
+#[test]
+fn flash_attn_acausal_splitkv() -> Result<()> {
+    // Small grid (batch * heads * m_blocks = 2) with 16 K-blocks: the
+    // heuristic returns >= 2 on any modern GPU, exercising the split
+    // kernels plus the fp32 combine kernel.
+    splitkv_against_reference(1, 2, 8, 512, 64)
+}
+
+#[test]
+fn flash_attn_decode_splitkv() -> Result<()> {
+    // Single-token decode over a long KV: seqlen_q = 1, seqlen_k = 4096,
+    // head_dim = 128. This is the long-context decode shape the splitkv
+    // dispatch exists for.
+    splitkv_against_reference(1, 8, 1, 4096, 128)
+}
+
+#[test]
+fn flash_attn_varlen_paged_mm_prefix_windowed() -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    let seq_len: usize = 296;
+    let n_heads: usize = 8;
+    let n_kv_heads: usize = 2;
+    let head_dim: usize = 256;
+    let block_size: usize = 32;
+    let num_blocks = seq_len.div_ceil(block_size);
+    let padded_len = num_blocks * block_size;
+    let elem_count = seq_len * n_heads * head_dim;
+    let q_data = (0..elem_count)
+        .map(|i| ((i % 251) as f32 - 125.0) / 125.0)
+        .collect::<Vec<_>>();
+    let q =
+        Tensor::from_vec(q_data, (seq_len, n_heads, head_dim), &device)?.to_dtype(DType::BF16)?;
+    let kv_elem_count = seq_len * n_kv_heads * head_dim;
+    let kv_data = (0..kv_elem_count)
+        .map(|i| ((i % 193) as f32 - 96.0) / 96.0)
+        .collect::<Vec<_>>();
+    let kv = Tensor::from_vec(kv_data, (seq_len, n_kv_heads, head_dim), &device)?
+        .to_dtype(DType::BF16)?;
+    let k_seq = (&kv / 4.)?;
+    let v_seq = (&kv / 5.)?;
+    let pad = Tensor::zeros(
+        (padded_len - seq_len, n_kv_heads, head_dim),
+        DType::BF16,
+        &device,
+    )?;
+    let k_paged =
+        Tensor::cat(&[&k_seq, &pad], 0)?.reshape((num_blocks, block_size, n_kv_heads, head_dim))?;
+    let v_paged =
+        Tensor::cat(&[&v_seq, &pad], 0)?.reshape((num_blocks, block_size, n_kv_heads, head_dim))?;
+    let seqlens = Tensor::new(&[0u32, seq_len as u32], &device)?;
+    let block_table = Tensor::new((0..num_blocks as u32).collect::<Vec<_>>(), &device)?
+        .reshape((1, num_blocks))?;
+    let mm_prefix_ranges = Tensor::new(&[6i32, 262i32], &device)?.reshape((1, 1, 2))?;
+
+    let ys_ref =
+        fa_windowed_mm_prefix(&q, &k_seq, &v_seq, 1.0, 1024, &[(6, 262)])?.to_dtype(DType::F32)?;
+    let ys_causal_ref =
+        fa_windowed_mm_prefix(&q, &k_seq, &v_seq, 1.0, 1024, &[])?.to_dtype(DType::F32)?;
+    let ys_causal = candle_flash_attn::flash_attn_varlen_paged_windowed(
+        &q,
+        &k_paged,
+        &v_paged,
+        &seqlens,
+        &seqlens,
+        &block_table,
+        None,
+        seq_len,
+        seq_len,
+        1.0,
+        Some(1024),
+        Some(0),
+        block_size,
+        None,
+    )?
+    .to_dtype(DType::F32)?;
+    let causal_diff = ys_causal_ref
+        .sub(&ys_causal)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?;
+    let causal_diff = causal_diff.to_vec0::<f32>()?.abs();
+    assert!(causal_diff < 0.125, "causal max diff {causal_diff}");
+
+    let ys = candle_flash_attn::flash_attn_varlen_paged_windowed(
+        &q,
+        &k_paged,
+        &v_paged,
+        &seqlens,
+        &seqlens,
+        &block_table,
+        Some(&mm_prefix_ranges),
+        seq_len,
+        seq_len,
+        1.0,
+        Some(1024),
+        Some(0),
+        block_size,
+        None,
+    )?
+    .to_dtype(DType::F32)?;
+
+    let diff = ys_ref.sub(&ys)?.abs()?.flatten_all()?.max(0)?;
+    let diff = diff.to_vec0::<f32>()?.abs();
+    assert!(diff < 0.125, "max diff {diff}");
+    Ok(())
+}
+
+#[test]
+fn flash_attn_varlen_paged_shuffled_block_table_hd256() -> Result<()> {
+    paged_shuffled_block_table(256)
+}
+
+#[test]
+fn flash_attn_varlen_paged_shuffled_block_table_hd512() -> Result<()> {
+    paged_shuffled_block_table(512)
+}
+
+fn paged_shuffled_block_table(head_dim: usize) -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    let seq_len: usize = 296;
+    let n_heads: usize = 8;
+    let n_kv_heads: usize = 2;
+    let block_size: usize = 32;
+    let num_blocks = seq_len.div_ceil(block_size);
+    let pool_blocks = num_blocks + 7;
+    let perm = (0..num_blocks)
+        .map(|i| (i * 5 + 3) % pool_blocks)
+        .collect::<Vec<_>>();
+    let elem_count = seq_len * n_heads * head_dim;
+    let q_data = (0..elem_count)
+        .map(|i| ((i % 251) as f32 - 125.0) / 125.0)
+        .collect::<Vec<_>>();
+    let q =
+        Tensor::from_vec(q_data, (seq_len, n_heads, head_dim), &device)?.to_dtype(DType::BF16)?;
+    let kv_elem_count = seq_len * n_kv_heads * head_dim;
+    let kv_data = (0..kv_elem_count)
+        .map(|i| ((i % 193) as f32 - 96.0) / 96.0)
+        .collect::<Vec<_>>();
+    let kv = Tensor::from_vec(kv_data, (seq_len, n_kv_heads, head_dim), &device)?
+        .to_dtype(DType::BF16)?;
+    let k_seq = (&kv / 4.)?;
+    let v_seq = (&kv / 5.)?;
+
+    let block_elems = block_size * n_kv_heads * head_dim;
+    let scatter = |seq: &Tensor| -> Result<Tensor> {
+        let data = seq.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let mut pool = vec![0f32; pool_blocks * block_elems];
+        for (logical, &physical) in perm.iter().enumerate() {
+            let src = logical * block_elems;
+            let len = block_elems.min(data.len() - src);
+            pool[physical * block_elems..physical * block_elems + len]
+                .copy_from_slice(&data[src..src + len]);
+        }
+        Ok(Tensor::from_vec(
+            pool,
+            (pool_blocks, block_size, n_kv_heads, head_dim),
+            &device,
+        )?
+        .to_dtype(DType::BF16)?)
+    };
+    let k_paged = scatter(&k_seq)?;
+    let v_paged = scatter(&v_seq)?;
+
+    let seqlens = Tensor::new(&[0u32, seq_len as u32], &device)?;
+    let block_table = Tensor::new(perm.iter().map(|&b| b as u32).collect::<Vec<_>>(), &device)?
+        .reshape((1, num_blocks))?;
+
+    let ys_ref = fa_windowed_mm_prefix(&q, &k_seq, &v_seq, 1.0, 1024, &[])?.to_dtype(DType::F32)?;
+    let ys = candle_flash_attn::flash_attn_varlen_paged_windowed(
+        &q,
+        &k_paged,
+        &v_paged,
+        &seqlens,
+        &seqlens,
+        &block_table,
+        None,
+        seq_len,
+        seq_len,
+        1.0,
+        Some(1024),
+        Some(0),
+        block_size,
+        None,
+    )?
+    .to_dtype(DType::F32)?;
+
+    let diff = ys_ref.sub(&ys)?.abs()?.flatten_all()?.max(0)?;
+    let diff = diff.to_vec0::<f32>()?.abs();
+    assert!(diff < 0.125, "max diff {diff}");
     Ok(())
 }
 

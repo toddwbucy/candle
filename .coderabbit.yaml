@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# CodeRabbit config for the toddwbucy/candle fork.
+# CodeRabbit reads .coderabbit.yaml from the repo default branch, not the PR
+# base. Since 2026-09-25 the default branch is integration, so this file lives
+# here and only here. main is a pure mirror of upstream/main and carries no
+# fork-only files; feat/* branches are cut from main, so this file can never
+# appear in an upstream PR diff.
+language: en-US
+reviews:
+  profile: assertive
+  review_status: false
+  auto_review:
+    enabled: true
+    # The default branch (integration) is always auto-reviewed. Listed anyway so
+    # the intent survives a default-branch change.
+    base_branches:
+      - integration

@@ -255,8 +255,40 @@ impl Device {
         Ok(Self::Cuda(crate::CudaDevice::new_with_stream(ordinal)?))
     }
 
+    /// Enable bidirectional peer access between two CUDA devices so cross-card
+    /// transfers (`Tensor::to_device`, `memcpy_peer_async`) route over NVLink /
+    /// PCIe P2P instead of failing. Idempotent. Errors if either device is not
+    /// CUDA or the driver rejects the pair. See
+    /// [`crate::CudaDevice::enable_peer_access`].
+    pub fn enable_peer_access(&self, other: &Self) -> Result<()> {
+        match (self, other) {
+            (Self::Cuda(a), Self::Cuda(b)) => a.enable_peer_access(b),
+            _ => crate::bail!(
+                "enable_peer_access requires two CUDA devices, got {:?} and {:?}",
+                self.location(),
+                other.location()
+            ),
+        }
+    }
+
     pub fn new_metal(ordinal: usize) -> Result<Self> {
         Ok(Self::Metal(crate::MetalDevice::new(ordinal)?))
+    }
+
+    /// Run `f` with device specific context.
+    ///
+    /// On CPU this installs candle's private rayon thread pool for the
+    /// duration of `f`, keeping worker threads warm across the many short
+    /// parallel sections in a model forward pass. Currently noop for other backends.
+    pub fn with_context<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R + Send,
+        R: Send,
+    {
+        match self {
+            Self::Cpu => crate::utils::with_threadpool(f),
+            _ => f(),
+        }
     }
 
     pub fn set_seed(&self, seed: u64) -> Result<()> {
