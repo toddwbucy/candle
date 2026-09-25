@@ -15,6 +15,13 @@ cargo clippy --workspace --tests --examples --benches -- -D warnings
 cargo test --workspace
 ```
 
+- Before opening any fork PR, run exactly what CI runs, on the whole workspace, under
+  stable: `cargo +stable check --workspace --all-targets` and
+  `cargo +stable clippy --workspace --tests --examples --benches -- -D warnings`.
+  Checking only the crates WeaverTools consumes is not enough: fork-only examples break
+  silently when upstream changes a shared API (the `gpt-oss` example on the 2026-09-25
+  sync). The local default toolchain is an old nightly that cannot build `candle-pyo3`
+  at current upstream; `+stable` can.
 - Single crate / single test: `cargo test -p candle-core --test tensor_tests matmul` (test files live in `<crate>/tests/*.rs`).
 - GPU backends are opt-in features: `--features cuda`, `cudnn`, `metal`, `mkl`, `accelerate`. Without them, CUDA/Metal test variants are compiled out.
 - Examples (in `candle-examples/examples/<name>/`): `cargo run --example quantized --release [--features cuda|cudnn|flash-attn|metal]`.
