@@ -444,8 +444,9 @@ mod tests {
         let cfg = test_config();
         let dim = cfg.hidden_size / cfg.num_attention_heads;
         // A correct f16 or bf16 table entry is within ~2e-3 of the reference.
-        // A table built from positions rounded to f16 or bf16 is off by O(1)
-        // in the high-frequency pairs at these positions.
+        // A table built from positions rounded to f16 or bf16 is off by up to
+        // O(1) in the high-frequency pairs at these positions (the smallest
+        // failure is the f16 second pair at 257, off by 1.5e-2).
         let tol = 1e-2;
         for dtype in [DType::F16, DType::BF16] {
             let rope = RotaryEmbedding::new(dtype, &cfg, dev)?;
