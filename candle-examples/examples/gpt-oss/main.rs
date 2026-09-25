@@ -15,7 +15,6 @@ use candle_examples::token_output_stream::TokenOutputStream;
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::models::gpt_oss::{Config, ModelForCausalLM};
-use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 
 struct TextGeneration {
@@ -163,12 +162,8 @@ fn main() -> Result<()> {
         DType::F32
     };
 
-    let api = Api::new()?;
-    let repo = api.repo(Repo::with_revision(
-        args.model_id,
-        RepoType::Model,
-        args.revision,
-    ));
+    let api = candle_examples::hub::Api::new()?;
+    let repo = api.model(args.model_id).with_revision(args.revision);
     let tokenizer_filename = repo.get("tokenizer.json")?;
     let config_filename = repo.get("config.json")?;
     let filenames = candle_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?;
