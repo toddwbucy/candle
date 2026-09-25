@@ -7,6 +7,7 @@ use candle_transformers::models::llama::Cache;
 
 use anyhow::{bail, Error as E, Result};
 use candle::{DType, Device, IndexOp, Tensor};
+use candle_examples::hub::Api;
 use candle_nn::VarBuilder;
 use candle_transformers::models::llava::config::{
     HFGenerationConfig, HFLLaVAConfig, HFPreProcessorConfig,
@@ -15,7 +16,6 @@ use candle_transformers::models::llava::{config::LLaVAConfig, LLaVA};
 use clap::Parser;
 use constants::*;
 use conversation::Conversation;
-use hf_hub::api::sync::Api;
 use image_processor::{process_image, ImageProcessor};
 use std::io::Write;
 use tokenizers::Tokenizer;
@@ -177,7 +177,7 @@ fn main() -> Result<()> {
         let config_filename = api.get("config.json")?;
         let llava_config: LLaVAConfig = serde_json::from_slice(&std::fs::read(config_filename)?)?;
         let tokenizer = Tokenizer::from_file(&args.tokenizer_path)
-            .map_err(|e| E::msg(format!("Error loading {}: {}", &args.tokenizer_path, e)))?;
+            .map_err(|e| E::msg(format!("Error loading {}: {}", args.tokenizer_path, e)))?;
         (
             llava_config.clone(),
             tokenizer,
@@ -258,7 +258,7 @@ fn main() -> Result<()> {
     println!("loading image");
     let (image_size, image_tensor) =
         load_image(&args.image_file, &image_processor, &llava_config, dtype)
-            .map_err(|e| E::msg(format!("Error loading {}: {}", &args.image_file, e)))?;
+            .map_err(|e| E::msg(format!("Error loading {}: {}", args.image_file, e)))?;
     let image_tensor = image_tensor.to_device(&device)?;
 
     let mut logits_processor = {

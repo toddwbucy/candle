@@ -263,7 +263,7 @@ impl Attention {
                     None => (k, v),
                 };
                 *slot = Some((k.clone(), v.clone()));
-                (k, v, mask.map(|m| m.clone()))
+                (k, v, mask.cloned())
             }
             KvCache::Sliding(cache) => {
                 // attn_mask reflects the state *after* appending seq_len, so it is
@@ -752,9 +752,8 @@ impl ModelWeights {
         };
 
         let mut layers = Vec::with_capacity(block_count);
-        for layer_idx in 0..block_count {
+        for (layer_idx, &sliding) in is_sliding.iter().enumerate() {
             let prefix = format!("blk.{layer_idx}");
-            let sliding = is_sliding[layer_idx];
             let head_dim = if sliding { key_length_swa } else { key_length };
             let n_kv_head =
                 head_count_kv
