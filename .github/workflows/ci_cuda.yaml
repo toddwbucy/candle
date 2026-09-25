@@ -4,6 +4,9 @@ on:
   workflow_dispatch:
   pull_request:
 
+# Fork-only guard (toddwbucy/candle): the `github.repository` clause below keeps
+# both jobs from running here, where no aws-g5-4xlarge-cache runner exists.
+# Do not carry it into an upstream PR.
 jobs:
   test-cuda:
     concurrency:
