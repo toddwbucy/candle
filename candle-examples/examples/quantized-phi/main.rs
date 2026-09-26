@@ -102,13 +102,13 @@ impl Args {
         let tokenizer_path = match &self.tokenizer {
             Some(config) => std::path::PathBuf::from(config),
             None => {
-                let api = hf_hub::api::sync::Api::new()?;
+                let api = candle_examples::hub::Api::new()?;
                 let repo = match self.which {
                     Which::Phi2 => "microsoft/phi-2",
                     Which::Phi3 | Which::Phi3b => "microsoft/Phi-3-mini-4k-instruct",
                     Which::Phi4 => "microsoft/phi-4",
                 };
-                let api = api.model(repo.to_string());
+                let api = api.model(repo);
                 api.get("tokenizer.json")?
             }
         };
@@ -133,13 +133,8 @@ impl Args {
                     ),
                     Which::Phi4 => ("microsoft/phi-4-gguf", "phi-4-q4.gguf", "main"),
                 };
-                let api = hf_hub::api::sync::Api::new()?;
-                api.repo(hf_hub::Repo::with_revision(
-                    repo.to_string(),
-                    hf_hub::RepoType::Model,
-                    revision.to_string(),
-                ))
-                .get(filename)?
+                let api = candle_examples::hub::Api::new()?;
+                api.model(repo).with_revision(revision).get(filename)?
             }
         };
         Ok(model_path)
@@ -207,7 +202,7 @@ fn main() -> anyhow::Result<()> {
     let mut model = {
         let model = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(model_path))?;
         let mut total_size_in_bytes = 0;
-        for (_, tensor) in model.tensor_infos.iter() {
+        for tensor in model.tensor_infos.values() {
             let elem_count = tensor.shape.elem_count();
             total_size_in_bytes +=
                 elem_count * tensor.ggml_dtype.type_size() / tensor.ggml_dtype.block_size();
@@ -215,7 +210,7 @@ fn main() -> anyhow::Result<()> {
         println!(
             "loaded {:?} tensors ({}) in {:.2}s",
             model.tensor_infos.len(),
-            &format_size(total_size_in_bytes),
+            format_size(total_size_in_bytes),
             start.elapsed().as_secs_f32(),
         );
         match args.which {
@@ -234,7 +229,7 @@ fn main() -> anyhow::Result<()> {
     let tokenizer = args.tokenizer()?;
     let mut tos = TokenOutputStream::new(tokenizer);
     let prompt_str = args.prompt.unwrap_or_else(|| DEFAULT_PROMPT.to_string());
-    print!("{}", &prompt_str);
+    print!("{}", prompt_str);
     let tokens = tos
         .tokenizer()
         .encode(prompt_str, true)
