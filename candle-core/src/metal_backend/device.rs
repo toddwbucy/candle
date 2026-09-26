@@ -1,7 +1,5 @@
 use crate::{DType, Result};
 
-#[cfg(feature = "ug")]
-use candle_metal_kernels::metal::ComputePipeline;
 use candle_metal_kernels::{
     metal::{
         BlitCommandsGuard, Buffer, BufferMap, Commands, CommandsGuard, Device, MTLResourceOptions,
@@ -97,29 +95,6 @@ impl std::ops::Deref for MetalDevice {
 }
 
 impl MetalDevice {
-    #[cfg(all(feature = "ug", not(target_arch = "wasm32"), not(target_os = "ios")))]
-    pub fn compile(
-        &self,
-        func_name: &'static str,
-        kernel: candle_ug::lang::ssa::Kernel,
-    ) -> Result<ComputePipeline> {
-        let mut buf = vec![];
-        candle_ug::metal::code_gen::gen(&mut buf, func_name, &kernel)?;
-        let metal_code = String::from_utf8(buf)?;
-        let lib = self
-            .device
-            .new_library_with_source(&metal_code, None)
-            .map_err(MetalError::from)?;
-        let func = lib
-            .get_function(func_name, None)
-            .map_err(MetalError::from)?;
-        let pl = self
-            .device
-            .new_compute_pipeline_state_with_function(&func)
-            .map_err(MetalError::from)?;
-        Ok(pl)
-    }
-
     pub fn id(&self) -> DeviceId {
         self.id
     }
@@ -192,6 +167,22 @@ impl MetalDevice {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Registers buffers in the device's residency set, keeping them
+    /// permanently GPU-resident instead of paying per-command-buffer residency
+    /// bookkeeping. Useful for buffers candle did not allocate, e.g.
+    /// `newBufferWithBytesNoCopy` views over an mmap'd weights file. No-op on
+    /// systems without residency-set support.
+    pub fn register_buffers<'a>(&self, bufs: impl IntoIterator<Item = &'a Buffer>) {
+        self.residency_set.insert_batch(bufs);
+    }
+
+    /// Unregisters buffers previously passed to `register_buffers`, releasing
+    /// the set's retain so they can be deallocated. Only unregister buffers
+    /// you registered yourself, after GPU work referencing them has completed.
+    pub fn unregister_buffers<'a>(&self, bufs: impl IntoIterator<Item = &'a Buffer>) {
+        self.residency_set.remove_batch(bufs);
     }
 
     /// Returns a builder for buffer allocation. See `BufferBuilder`.

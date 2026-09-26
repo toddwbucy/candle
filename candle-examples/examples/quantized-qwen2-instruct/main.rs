@@ -98,7 +98,7 @@ impl Args {
         let tokenizer_path = match &self.tokenizer {
             Some(config) => std::path::PathBuf::from(config),
             None => {
-                let api = hf_hub::api::sync::Api::new()?;
+                let api = candle_examples::hub::Api::new()?;
                 let repo = match self.which {
                     Which::W2_0_5b => "Qwen/Qwen2-0.5B-Instruct",
                     Which::W2_1_5b => "Qwen/Qwen2-1.5B-Instruct",
@@ -106,7 +106,7 @@ impl Args {
                     Which::W2_72b => "Qwen/Qwen2-72B-Instruct",
                     Which::DeepseekR1Qwen7B => "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
                 };
-                let api = api.model(repo.to_string());
+                let api = api.model(repo);
                 api.get("tokenizer.json")?
             }
         };
@@ -144,13 +144,8 @@ impl Args {
                         "main",
                     ),
                 };
-                let api = hf_hub::api::sync::Api::new()?;
-                api.repo(hf_hub::Repo::with_revision(
-                    repo.to_string(),
-                    hf_hub::RepoType::Model,
-                    revision.to_string(),
-                ))
-                .get(filename)?
+                let api = candle_examples::hub::Api::new()?;
+                api.model(repo).with_revision(revision).get(filename)?
             }
         };
         Ok(model_path)
@@ -202,7 +197,7 @@ fn main() -> anyhow::Result<()> {
     let mut model = {
         let model = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(model_path))?;
         let mut total_size_in_bytes = 0;
-        for (_, tensor) in model.tensor_infos.iter() {
+        for tensor in model.tensor_infos.values() {
             let elem_count = tensor.shape.elem_count();
             total_size_in_bytes +=
                 elem_count * tensor.ggml_dtype.type_size() / tensor.ggml_dtype.block_size();
@@ -210,7 +205,7 @@ fn main() -> anyhow::Result<()> {
         println!(
             "loaded {:?} tensors ({}) in {:.2}s",
             model.tensor_infos.len(),
-            &format_size(total_size_in_bytes),
+            format_size(total_size_in_bytes),
             start.elapsed().as_secs_f32(),
         );
         Qwen2::from_gguf(model, &mut file, &device)?
@@ -228,7 +223,7 @@ fn main() -> anyhow::Result<()> {
         Which::DeepseekR1Qwen7B => format!("<｜User｜>{prompt_str}<｜Assistant｜>"),
         _ => format!("<|im_start|>user\n{prompt_str}<|im_end|>\n<|im_start|>assistant\n"),
     };
-    print!("formatted instruct prompt: {}", &prompt_str);
+    print!("formatted instruct prompt: {}", prompt_str);
     let tokens = tos
         .tokenizer()
         .encode(prompt_str, true)

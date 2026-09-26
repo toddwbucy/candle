@@ -80,15 +80,20 @@ leak into an upstream PR before it is meant to be submitted.
 
 - Before opening or updating an upstream PR, confirm the diff carries no agent or
   review tooling files. This must print nothing:
-  `git diff --name-only upstream/main...HEAD | grep -Ei 'claude\.md|agents\.md|coderabbit|\.cursor|copilot'`
-- Posting to `huggingface/candle` (comments, PR descriptions, force-pushes of a PR
-  branch) is the operator's decision per action. Draft the text, show it, wait.
+  `git diff --name-only upstream/main...HEAD | grep -Ei 'claude\.md|agents\.md|codex|coderabbit|\.cursor|copilot'`
+- Commits bound for upstream carry no AI attribution trailer. Fork-only commits may.
+- Anything upstream-visible is the operator's own act, per action, on explicit
+  instruction naming that action: opening a PR, any push (fast-forward included) to a
+  `feat/*` branch that backs an open upstream PR, a comment, a description edit, a
+  close. Sessions prepare commits and texts on the fork and stop. Reason: #3581 went up
+  before its author's own review was finished and had to be withdrawn.
 
 **Fork PRs**
 
-- Every change to `integration` goes through a PR on `toddwbucy/candle` with a
-  CodeRabbit review and an independent sub-agent review. Nothing is pushed straight to
-  `main`, `integration` or a `weaver/*` branch.
+- Every code change to `integration` goes through a PR on `toddwbucy/candle` with an
+  automated review (Codex auto-review as of 2026-09-25, replacing CodeRabbit, whose
+  `.coderabbit.yaml` stays until the switch is confirmed) and an independent sub-agent
+  review posted on the PR. Nothing is pushed straight to `main` or a `weaver/*` branch.
 - Reverting a feature (e.g. after withdrawing its upstream PR) is a `git revert -m 1`
   of its merge commit on `integration`, via PR. No history rewriting.
 

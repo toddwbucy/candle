@@ -90,10 +90,10 @@ impl Args {
         let tokenizer_path = match &self.tokenizer {
             Some(config) => std::path::PathBuf::from(config),
             None => {
-                let api = hf_hub::api::sync::Api::new()?;
+                let api = candle_examples::hub::Api::new()?;
                 let repo = "google/gemma-3-4b-it";
                 println!("DEBUG: Downloading tokenizer from {repo}");
-                let api = api.model(repo.to_string());
+                let api = api.model(repo);
                 api.get("tokenizer.json")?
             }
         };
@@ -113,13 +113,8 @@ impl Args {
                         "gemma-3-4b-it-q4_0.gguf",
                     ),
                 };
-                let api = hf_hub::api::sync::Api::new()?;
-                api.repo(hf_hub::Repo::with_revision(
-                    repo.to_string(),
-                    hf_hub::RepoType::Model,
-                    "main".to_string(),
-                ))
-                .get(filename)?
+                let api = candle_examples::hub::Api::new()?;
+                api.model(repo).with_revision("main").get(filename)?
             }
         };
         Ok(model_path)
@@ -178,7 +173,7 @@ fn main() -> anyhow::Result<()> {
     let mut model = {
         let model = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(&model_path))?;
         let mut total_size_in_bytes = 0;
-        for (_, tensor) in model.tensor_infos.iter() {
+        for tensor in model.tensor_infos.values() {
             let elem_count = tensor.shape.elem_count();
             total_size_in_bytes +=
                 elem_count * tensor.ggml_dtype.type_size() / tensor.ggml_dtype.block_size();
@@ -186,7 +181,7 @@ fn main() -> anyhow::Result<()> {
         println!(
             "loaded {:?} tensors ({}) in {:.2}s",
             model.tensor_infos.len(),
-            &format_size(total_size_in_bytes),
+            format_size(total_size_in_bytes),
             start.elapsed().as_secs_f32(),
         );
         ModelWeights::from_gguf(model, &mut file, &device)?
@@ -227,7 +222,7 @@ fn main() -> anyhow::Result<()> {
                 format!("<start_of_turn> user\n{prompt}<end_of_turn>\n<start_of_turn> model\n")
             }
         };
-        print!("{}", &prompt_str);
+        print!("{}", prompt_str);
 
         let tokens = tos
             .tokenizer()
