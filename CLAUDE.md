@@ -82,8 +82,11 @@ leak into an upstream PR before it is meant to be submitted.
   review tooling files. This must print nothing:
   `git diff --name-only upstream/main...HEAD | grep -Ei 'claude\.md|agents\.md|codex|coderabbit|\.cursor|copilot'`
 - Commits bound for upstream carry no AI attribution trailer. Fork-only commits may.
-- Posting to `huggingface/candle` (comments, PR descriptions, force-pushes of a PR
-  branch) is the operator's decision per action. Draft the text, show it, wait.
+- Anything upstream-visible is the operator's own act, per action, on explicit
+  instruction naming that action: opening a PR, any push (fast-forward included) to a
+  `feat/*` branch that backs an open upstream PR, a comment, a description edit, a
+  close. Sessions prepare commits and texts on the fork and stop. Reason: #3581 went up
+  before its author's own review was finished and had to be withdrawn.
 
 **Fork PRs**
 
