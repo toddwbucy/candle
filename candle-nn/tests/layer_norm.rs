@@ -61,3 +61,36 @@ fn layer_norm() -> Result<()> {
 
     Ok(())
 }
+
+// Loading through a VarBuilder: a norm without a bias must not need a bias
+// tensor, a fresh VarMap must initialise lazily, and the gamma/beta names
+// from older checkpoints still resolve.
+#[test]
+fn layer_norm_loading() -> Result<()> {
+    use candle::DType;
+    use candle_nn::VarBuilder;
+    use std::collections::HashMap;
+    let dev = &Device::Cpu;
+    let ones = Tensor::ones(4, DType::F32, dev)?;
+    let zeros = Tensor::zeros(4, DType::F32, dev)?;
+
+    let only_weight = HashMap::from([("weight".to_string(), ones.clone())]);
+    let vb = VarBuilder::from_tensors(only_weight, DType::F32, dev);
+    candle_nn::rms_norm(4, 1e-5, vb.clone())?;
+    candle_nn::layer_norm_no_bias(4, 1e-5, vb.clone())?;
+    assert!(candle_nn::layer_norm(4, 1e-5, vb).is_err());
+
+    let legacy = HashMap::from([
+        ("gamma".to_string(), ones.clone()),
+        ("beta".to_string(), zeros.clone()),
+    ]);
+    let vb = VarBuilder::from_tensors(legacy, DType::F32, dev);
+    candle_nn::layer_norm(4, 1e-5, vb)?;
+
+    let varmap = candle_nn::VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, dev);
+    candle_nn::rms_norm(4, 1e-5, vb.pp("rms"))?;
+    candle_nn::layer_norm(4, 1e-5, vb.pp("ln"))?;
+    assert_eq!(varmap.all_vars().len(), 3);
+    Ok(())
+}
