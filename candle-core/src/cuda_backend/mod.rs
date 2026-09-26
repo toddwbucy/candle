@@ -1319,14 +1319,11 @@ impl CudaStorage {
 
     pub fn transfer_to_device(&self, dst: &CudaDevice) -> Result<Self> {
         let dst_stream = dst.cuda_stream();
-        // Cross-device copies are enqueued on the destination stream, which
-        // has no implicit ordering against the source stream: without a
-        // fence the copy can read buffers the producer has not finished
-        // writing, and the forward goes nondeterministic under load. The
-        // pre-fence makes the destination wait on the source's queued work
-        // before copying. The post-fence below makes the source wait on the
-        // copy, because frees are stream-ordered on the source stream and a
-        // dropped source tensor could otherwise free mid-copy.
+        // Cross-device copies are enqueued on the destination stream. cudarc
+        // (0.19.x) already makes that stream wait on the source's queued work
+        // before a cross-context copy, so this pre-fence is belt and braces:
+        // one extra event, kept so the ordering does not depend on a cudarc
+        // internal. The post-fence below is the one that matters.
         let src_stream = self.device.cuda_stream();
         let produced = src_stream.record_event(None).w()?;
         dst_stream.wait(&produced).w()?;
