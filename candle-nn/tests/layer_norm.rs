@@ -87,6 +87,15 @@ fn layer_norm_loading() -> Result<()> {
     let vb = VarBuilder::from_tensors(legacy, DType::F32, dev);
     candle_nn::layer_norm(4, 1e-5, vb)?;
 
+    // Both names present: the current one wins.
+    let both = HashMap::from([
+        ("weight".to_string(), ones.clone()),
+        ("gamma".to_string(), (&ones * 2.0)?),
+    ]);
+    let vb = VarBuilder::from_tensors(both, DType::F32, dev);
+    let rms = candle_nn::rms_norm(4, 1e-5, vb)?;
+    assert_eq!(rms.into_inner().weight().to_vec1::<f32>()?, [1f32; 4]);
+
     let varmap = candle_nn::VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, dev);
     candle_nn::rms_norm(4, 1e-5, vb.pp("rms"))?;
