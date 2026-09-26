@@ -1319,6 +1319,14 @@ impl CudaStorage {
 
     pub fn transfer_to_device(&self, dst: &CudaDevice) -> Result<Self> {
         let dst_stream = dst.cuda_stream();
+        // Cross-device copies are enqueued on the destination stream. cudarc
+        // (0.19.x) already makes that stream wait on the source's queued work
+        // before a cross-context copy, so this pre-fence is belt and braces:
+        // one extra event, kept so the ordering does not depend on a cudarc
+        // internal. The post-fence below is the one that matters.
+        let src_stream = self.device.cuda_stream();
+        let produced = src_stream.record_event(None).w()?;
+        dst_stream.wait(&produced).w()?;
         let storage_slice = match self.dtype() {
             DType::U8 => {
                 let cuda_slice = self.as_cuda_slice::<u8>()?;
@@ -1391,6 +1399,11 @@ impl CudaStorage {
                 CudaStorageSlice::F8E8M0(result)
             }
         };
+        // The post-fence: the source stream waits on the copy before any
+        // later source-side work, including the stream-ordered free of the
+        // source buffer when its tensor drops.
+        let copied = dst_stream.record_event(None).w()?;
+        src_stream.wait(&copied).w()?;
 
         Ok(Self {
             slice: storage_slice,

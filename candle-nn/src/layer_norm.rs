@@ -28,7 +28,7 @@
 //! ```
 //!
 //! [`Layer Normalization`]: https://arxiv.org/abs/1607.06450
-use candle::{DType, Error, Module, Result, Tensor, D};
+use candle::{DType, Module, Result, Tensor, D};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayerNormConfig {
@@ -153,20 +153,21 @@ pub fn layer_norm<C: Into<LayerNormConfig>>(
     // Convert old format to new format if needed from a PyTorch state_dict
     // Safetensors not always in new weight/bias format
     // https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_utils.py#L575
-    let weight_tensor_name = ["weight", "gamma"]
-        .iter()
-        .find(|&name| vb.contains_tensor(name))
-        .ok_or_else(|| Error::Msg("Failed to find weight tensor".into()))?;
+    // Use the legacy name only when the checkpoint has it and the current one is
+    // absent. Otherwise ask for the current name, so a lazily initialised VarMap
+    // still works and a missing tensor is reported under its real name.
+    let pick = |name: &'static str, legacy: &'static str| {
+        if !vb.contains_tensor(name) && vb.contains_tensor(legacy) {
+            legacy
+        } else {
+            name
+        }
+    };
 
-    let weight = vb.get_with_hints(size, weight_tensor_name, crate::Init::Const(1.))?;
-
-    let bias_tensor_name = ["bias", "beta"]
-        .iter()
-        .find(|&name| vb.contains_tensor(name))
-        .ok_or_else(|| Error::Msg("Failed to find weight tensor".into()))?;
+    let weight = vb.get_with_hints(size, pick("weight", "gamma"), crate::Init::Const(1.))?;
 
     let bias = if config.affine {
-        Some(vb.get_with_hints(size, bias_tensor_name, crate::Init::Const(0.))?)
+        Some(vb.get_with_hints(size, pick("bias", "beta"), crate::Init::Const(0.))?)
     } else {
         None
     };
