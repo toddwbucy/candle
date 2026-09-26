@@ -52,19 +52,17 @@ impl RotaryEmbedding {
             .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
             .collect();
         let inv_freq_len = inv_freq.len();
-        // Compute the cos/sin tables in fp32, then cast to `dtype`
-        // only at the end. Casting `inv_freq` and `t` to bf16 *before*
-        // the matmul loses precision for `position * inv_freq` at
-        // long-context positions: bf16's 7-bit mantissa cannot
-        // represent integer positions above ~256 precisely, so for
-        // `position = 15000+` the angle rounds to neighbouring
-        // representable values, and `cos()` / `sin()` of those
-        // rounded angles diverge wildly from the true cosines (e.g.
-        // `cos(15962) ≈ -0.547` vs `cos(15968) ≈ -0.882` — both
-        // representable bf16 neighbours of 15962). HuggingFace's
-        // Python reference forces fp32 here via
-        // `torch.autocast(enabled=False)` + explicit `.float()`;
-        // candle's own `qwen3_vl/text.rs` already does the same.
+        // Build the cos/sin tables in fp32 and cast to `dtype` only at the end.
+        // Casting `inv_freq` and `t` to bf16 before the matmul goes wrong twice.
+        // Rounding `inv_freq` perturbs the angle in proportion to the position
+        // from the first token (0.24 rad by position 256 in the second pair).
+        // And bf16 has 8 significand bits, so not every integer above 256 is
+        // representable (257 rounds to 256, 15962 to 15936); for the
+        // highest-frequency pair (`inv_freq[0] = 1`) the angle is the position,
+        // so cos(257) = 0.8193 comes out as cos(256) = -0.0398. On CPU there is
+        // no bf16 matmul, so the bf16 table could not be built at all. The HF
+        // reference computes this in fp32 (`torch.autocast(enabled=False)` and
+        // `.float()`), as does `qwen3_vl/text.rs` here.
         let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?;
         let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
             .to_dtype(DType::F32)?
@@ -473,4 +471,66 @@ mod tests {
         }
         Ok(())
     }
+
+    // Positions that do not survive a round trip through bf16
+    // (257 -> 256, 1023 -> 1024, 4095 -> 4096, 15962 -> 15936) or f16
+    // (4095 -> 4096, 15962 -> 15960).
+    const POSITIONS: [usize; 4] = [257, 1023, 4095, 15962];
+
+    fn test_config() -> Config {
+        Config {
+            vocab_size: 8,
+            hidden_size: 64,
+            intermediate_size: 8,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            max_position_embeddings: 16384,
+            sliding_window: 16384,
+            max_window_layers: 1,
+            tie_word_embeddings: true,
+            rope_theta: 1_000_000.,
+            rms_norm_eps: 1e-6,
+            use_sliding_window: false,
+            hidden_act: Activation::Silu,
+        }
+    }
+
+    fn rotary_tables_are_built_in_fp32(dev: &Device) -> Result<()> {
+        let cfg = test_config();
+        let dim = cfg.hidden_size / cfg.num_attention_heads;
+        // A correct f16 or bf16 table entry is within ~2e-3 of the reference.
+        // A table built from positions rounded to f16 or bf16 is off by up to
+        // O(1) in the high-frequency pairs at these positions (the smallest
+        // failure is the f16 second pair at 257, off by 1.5e-2).
+        let tol = 1e-2;
+        for dtype in [DType::F16, DType::BF16] {
+            let rope = RotaryEmbedding::new(dtype, &cfg, dev)?;
+            let cos = rope.cos.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+            let sin = rope.sin.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+            for &pos in POSITIONS.iter() {
+                for (j, i) in (0..dim).step_by(2).enumerate() {
+                    let angle = pos as f64 / cfg.rope_theta.powf(i as f64 / dim as f64);
+                    let (want_cos, want_sin) = (angle.cos() as f32, angle.sin() as f32);
+                    let (got_cos, got_sin) = (cos[pos][j], sin[pos][j]);
+                    assert!(
+                        (got_cos - want_cos).abs() < tol,
+                        "{dtype:?} cos at position {pos}, dim {i}: got {got_cos}, want {want_cos}"
+                    );
+                    assert!(
+                        (got_sin - want_sin).abs() < tol,
+                        "{dtype:?} sin at position {pos}, dim {i}: got {got_sin}, want {want_sin}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    candle::test_device!(
+        rotary_tables_are_built_in_fp32,
+        rotary_tables_are_built_in_fp32_cpu,
+        rotary_tables_are_built_in_fp32_gpu,
+        rotary_tables_are_built_in_fp32_metal
+    );
 }
