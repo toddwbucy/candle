@@ -327,8 +327,8 @@ impl Model {
         // dtype, so the cat at a nonzero offset concatenated two dtypes -
         // every multi-token delta after a resident prefix. Cast before the
         // cat so both halves agree.
-        let mask = Tensor::from_slice(&mask, (tgt_len, tgt_len), &self.device)?
-            .to_dtype(self.dtype)?;
+        let mask =
+            Tensor::from_slice(&mask, (tgt_len, tgt_len), &self.device)?.to_dtype(self.dtype)?;
         let mask = if seqlen_offset > 0 {
             let mask0 = Tensor::zeros((tgt_len, seqlen_offset), self.dtype, &self.device)?;
             Tensor::cat(&[&mask0, &mask], D::Minus1)?
@@ -577,5 +577,40 @@ mod tests {
         rotary_tables_are_built_in_fp32_cpu,
         rotary_tables_are_built_in_fp32_gpu,
         rotary_tables_are_built_in_fp32_metal
+    );
+
+    // forward_with_intermediates must agree with forward on the logits and
+    // return one residual per layer, including a multi-token step after a
+    // resident prefix in a half dtype (the offset mask used to cat f32 onto
+    // the model dtype there and fail).
+    fn intermediates_match_forward(dev: &Device) -> Result<()> {
+        let mut cfg = tiny_config();
+        cfg.num_hidden_layers = 2;
+        let varmap = candle_nn::VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F16, dev);
+        let mut plain = ModelForCausalLM::new(&cfg, vb.clone())?;
+        let mut tapped = ModelForCausalLM::new(&cfg, vb)?;
+        for (ids, offset) in [(&[1u32, 2, 3][..], 0), (&[4u32, 5][..], 3)] {
+            let input = Tensor::new(ids, dev)?.unsqueeze(0)?;
+            let want = plain.forward(&input, offset)?;
+            let (got, residuals) = tapped.forward_with_intermediates(&input, offset)?;
+            assert_eq!(residuals.len(), cfg.num_hidden_layers);
+            for r in residuals.iter() {
+                assert_eq!(r.dims(), &[1, ids.len(), cfg.hidden_size]);
+            }
+            let diff = (want.to_dtype(DType::F32)? - got.to_dtype(DType::F32)?)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            assert_eq!(diff, 0.0, "logits differ at offset {offset}");
+        }
+        Ok(())
+    }
+
+    candle::test_device!(
+        intermediates_match_forward,
+        intermediates_match_forward_cpu,
+        intermediates_match_forward_gpu,
+        intermediates_match_forward_metal
     );
 }
